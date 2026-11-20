@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Check this machine for what the local stack and the agent workflow need.
+set -uo pipefail
+
+if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
+  cat <<'HELP'
+Usage: bin/doctor
+
+Checks this machine and prints one line per check, marked ok, warn or FAIL,
+with a "fix:" line under each problem. Changes nothing. Exits 1 when a
+required check fails, 0 otherwise.
+
+Required:
+  git installed
+  docker installed, the Docker daemon running, Docker Compose 2.22 or newer
+    (the first with watch)
+  ss or lsof installed: a session claim needs one to see busy ports
+  gh installed and authenticated (gh auth status)
+Warnings only:
+  Claude Code (claude) and Orca (orca) on PATH
+  Claude Code's auto permission mode (permissions.defaultMode "auto" in its
+    user settings), which automatic mode's unattended workers need
+  Node 24 or newer for bin/openspec, whose first run downloads the pinned
+    OpenSpec CLI through npx
+  a local .env and the repository git hooks: bin/setup makes both
+On WSL (WSL_DISTRO_NAME set, or "microsoft" in the kernel release):
+  the checkout must not be on the Windows drive (/mnt/<drive>/): bind mounts
+    there are slow and lose executable bits
+  core.autocrlf true warns: .gitattributes already keeps LF endings
+
+Environment, for tests:
+  FACTORY_DOCTOR_ROOT       the checkout to check (default: this repository)
+  FACTORY_DOCTOR_OSRELEASE  the kernel release file (default:
+                            /proc/sys/kernel/osrelease)
+  CLAUDE_CONFIG_DIR         Claude Code's settings folder (default: ~/.claude)
+HELP
+  exit 0
+fi
+[ "$#" -eq 0 ] || { echo "usage: bin/doctor" >&2; exit 2; }
+
+ROOT="${FACTORY_DOCTOR_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}"
+OSRELEASE="${FACTORY_DOCTOR_OSRELEASE:-/proc/sys/kernel/osrelease}"
+FAILED=0
+
+ok() { echo "ok   $1"; }
+warn() { echo "warn $1"; echo "     fix: $2"; }
+bad() { echo "FAIL $1"; echo "     fix: $2"; FAILED=1; }
+have() { command -v "$1" > /dev/null 2>&1; }
+
+WSL=0
+if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft "$OSRELEASE" 2> /dev/null; then WSL=1; fi
+
+docker_install() {
+  if [ "$WSL" = 1 ]; then
+    echo "install Docker Desktop on Windows and turn on its WSL integration for this distribution"
+  elif [ "$(uname -s)" = Darwin ]; then
+    echo "install OrbStack (brew install orbstack) or Docker Desktop"
+  else
+    echo "install Docker Engine with the Compose plugin: https://docs.docker.com/engine/install/"
+  fi
+}
+
+# True when version $1 (major.minor[.patch], an optional leading v) is at least $2.$3.
+version_at_least() {
+  local major minor
+  major="$(printf '%s' "$1" | sed -n 's/^v\{0,1\}\([0-9][0-9]*\)\..*/\1/p')"
+  minor="$(printf '%s' "$1" | sed -n 's/^v\{0,1\}[0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p')"
+  [ -n "$major" ] && [ -n "$minor" ] || return 1
+  [ "$major" -gt "$2" ] || { [ "$major" -eq "$2" ] && [ "$minor" -ge "$3" ]; }
+}
+
+if have git; then ok "git installed"; else bad "git installed" "install git with your package manager"; fi
+
+if ! have docker; then
+  bad "docker installed" "$(docker_install)"
+else
+  ok "docker installed"
+  if docker info > /dev/null 2>&1; then
+    ok "Docker daemon running"
+    compose="$(docker compose version --short 2> /dev/null || true)"
+    if version_at_least "$compose" 2 22; then
+      ok "Docker Compose 2.22 or newer ($compose)"
+    else
+      bad "Docker Compose 2.22 or newer (found ${compose:-none})" "update Docker (Desktop, OrbStack or the docker-compose-plugin package)"
+    fi
+  else
+    bad "Docker daemon running" "start Docker (OrbStack, Docker Desktop, or sudo systemctl start docker), then run bin/doctor again"
+  fi
+fi
+
+if have ss || have lsof; then
+  ok "ss or lsof installed"
+else
+  bad "ss or lsof installed" "install iproute2 (ss) or lsof with your package manager"
+fi
+
+if ! have gh; then
+  bad "gh installed and authenticated" "install the GitHub CLI: https://cli.github.com, then gh auth login"
+elif gh auth status > /dev/null 2>&1; then
+  ok "gh installed and authenticated"
+else
+  bad "gh installed and authenticated" "gh auth login (check the network first if you are logged in)"
+fi
+
+if have claude; then ok "Claude Code installed"; else warn "Claude Code installed" "install Claude Code: https://claude.com/claude-code"; fi
+# Automatic mode's unattended workers need Claude Code's auto permission mode:
+# the default mode prompts on every command substitution, and Claude Code takes
+# the auto mode only from the user's settings, never from the project's.
+if have claude; then
+  CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  MODE="$(sed -n 's/.*"defaultMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CLAUDE_SETTINGS" 2> /dev/null | head -n 1)"
+  if [ "$MODE" = auto ]; then
+    ok "Claude Code auto permission mode (automatic mode's workers need it)"
+  else
+    warn "Claude Code auto permission mode (automatic mode's workers need it; found ${MODE:-none})" \
+      "set \"permissions\": {\"defaultMode\": \"auto\"} in $CLAUDE_SETTINGS"
+  fi
+fi
+if have orca; then ok "Orca installed"; else warn "Orca installed" "only Orca workspaces need it: https://github.com/stablyai/orca"; fi
+# bin/openspec runs a pinned CLI through npx: say that its first run downloads it.
+OPENSPEC="$(sed -n 's/^OPENSPEC_VERSION="\(.*\)"$/\1/p' "$(dirname "${BASH_SOURCE[0]}")/openspec" 2> /dev/null)"
+NODE="$(node --version 2> /dev/null || true)"
+if version_at_least "$NODE" 24 0; then
+  ok "Node 24 for bin/openspec ($NODE; the first bin/openspec run downloads OpenSpec $OPENSPEC through npx)"
+else
+  warn "Node 24 for bin/openspec (found ${NODE:-none})" "install Node 24 or later: https://nodejs.org"
+fi
+if [ -f "$ROOT/.env" ]; then ok ".env written"; else warn ".env written" "run bin/setup"; fi
+if [ "$(git -C "$ROOT" config core.hooksPath 2> /dev/null)" = .githooks ]; then
+  ok "git hooks enabled"
+else
+  warn "git hooks enabled" "run bin/setup"
+fi
+
+if [ "$WSL" = 1 ]; then
+  case "$ROOT" in
+    /mnt/[a-zA-Z]/*) bad "WSL checkout in the Linux filesystem ($ROOT)" "clone into the Linux home directory (~/), not under /mnt/<drive>/" ;;
+    *) ok "WSL checkout in the Linux filesystem" ;;
+  esac
+  if [ "$(git -C "$ROOT" config core.autocrlf 2> /dev/null)" = true ]; then
+    warn "WSL line endings (core.autocrlf is true)" "git config --global core.autocrlf input"
+  else
+    ok "WSL line endings"
+  fi
+fi
+
+exit "$FAILED"

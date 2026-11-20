@@ -1,0 +1,15 @@
+# Orca workspace hooks. Each runs the workspace's own copy of a script, never
+# the main checkout's, so a branch tests the hooks it changes. Orca reads
+# setup from the new workspace's orca.yaml and archive from the main
+# checkout's. Orca skips archive for a checkout git lists as prunable and for
+# `orca worktree rm` without --run-hooks; bin/up reaps what that leaves.
+#
+# No issueCommand: Orca runs it as a shell command in a split pane, not as the
+# agent's prompt. An issue workspace's agent starts with the issue URL
+# pre-filled, which AGENTS.md maps to /work, and bin/orca-autostart submits it.
+scripts:
+  setup: bash "${ORCA_WORKTREE_PATH:-.}/bin/orca-setup"
+  archive: bash "${ORCA_WORKTREE_PATH:-.}/bin/orca-archive"
+# The agent tab opens at once, beside setup. /work still waits for setup:
+# bin/orca-setup starts bin/orca-autostart only once the stack is healthy.
+setupAgentStartupPolicy: start-immediately

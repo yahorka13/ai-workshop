@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit(/**)",
+      "Read(/**)",
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(bin/*)",
+      "Bash(orca *)",
+      "Bash(jq *)",
+      "Bash(sed -n *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(cut *)",
+      "Bash(tr *)",
+      "Bash(basename *)",
+      "Bash(dirname *)",
+      "Bash(mktemp *)",
+      "Bash(test *)",
+      "Bash(date *)",
+      "Bash(command -v *)",
+      "mcp__plugin_playwright_playwright__*"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git rebase *)",
+      "Bash(git push origin main*)",
+      "Bash(gh pr merge *)",
+      "Bash(gh repo delete *)",
+      "Bash(gh pr merge)",
+      "Bash(gh api *merge*)",
+      "Bash(git push *--no-verify*)",
+      "Bash(git -c *)",
+      "Bash(git pull *--rebase*)",
+      "Bash(git pull -r*)",
+      "Bash(git pull * -r*)"
+    ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true,
+    "playwright@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true
+  }
+}

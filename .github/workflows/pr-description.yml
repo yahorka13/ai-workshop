@@ -1,0 +1,70 @@
+# Checks on the pull request's description. They read the description live, so
+# they run in a workflow of their own that an edited description starts again
+# without re-running the repository checks. A push runs them too, so that a
+# branch protection rule requiring them finds a result for the new head commit.
+# Branch protection, where enabled, requires these job IDs, so keep them stable.
+name: Pull request description
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+# Only the newest run matters: every run reads the description as it is now.
+concurrency:
+  group: pr-description-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # A ready pull request lists what the independent agent review found.
+  review-section:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # reads the draft state and the description
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bin/ci-review-section.sh "$PR"
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+
+  # A ready pull request that changes the UI's hand-written code shows it in
+  # its ## Proof section (bin/ci-ui-proof.sh --help).
+  ui-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # reads the draft state, the files and the description
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: bin/ci-ui-proof.sh "$PR"
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+
+  # The title and body follow AGENTS.md → "Pull requests". Drafts are checked
+  # too: /work-pr writes the whole body when it opens the draft.
+  pr-body:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # reads the title, the branch and the description
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0 # the diff against the base lists the PR's changes
+      - run: bin/ci-pr-body.sh "$PR"
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

@@ -1,0 +1,11 @@
+[test]
+preload = ["./tests/setup.ts"]
+coverageThreshold = { lines = 1, functions = 1 }
+coverageReporter = ["text", "lcov"]
+# Test fixture construction is test infrastructure, not production source.
+# src/services/graphql/generated/ holds typed documents emitted by
+# bin/contracts generate; the contracts check, not coverage, proves they match
+# their contract.
+# tooling/mutate.ts only spawns Stryker and calls tooling/mutation-report.ts,
+# which is covered; the entry is proven by bin/tests/mutate.e2e.sh.
+coveragePathIgnorePatterns = ["tests/**", "src/services/graphql/generated/**", "tooling/mutate.ts"]

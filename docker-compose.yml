@@ -1,0 +1,89 @@
+# The local stack's services. bin/compose layers docker-compose.local.yml
+# (limits) and docker-compose.session.yml (published ports) over this file, and
+# loads .env (bin/setup-env.sh) and .env.session (bin/up). Nothing here
+# publishes a port: Compose appends port lists across files, so a port in
+# another file would be published twice.
+name: factory
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: 8m
+      max-file: "2" # string: Docker reads log options as strings
+
+# Timing every health check shares; each service brings its own probe.
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 2s
+  start_period: 5s
+  retries: 3
+
+services:
+  postgres:
+    <<: *logging
+    image: postgres:17.12-alpine@sha256:a77aa70e641402a21411b92b721c58d10f23b50ae5fdd2333efd22d166e1e5f7
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?run bin/setup to write .env}
+      POSTGRES_DB: ${POSTGRES_DB:?run bin/setup to write .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run bin/setup to write .env}
+    healthcheck:
+      <<: *healthcheck
+      test: [CMD-SHELL, pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [private]
+
+  backend:
+    <<: *logging
+    build:
+      context: services/backend
+      target: runtime
+    environment:
+      POSTGRES_URL: postgres://postgres:5432 # the postgres service on the private network
+      POSTGRES_USER: ${POSTGRES_USER:?run bin/setup to write .env}
+      POSTGRES_DB: ${POSTGRES_DB:?run bin/setup to write .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run bin/setup to write .env}
+      AUTH_SECRET: ${AUTH_SECRET:?run bin/setup to write .env}
+    # The image applies the migration history before it serves.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: [CMD, bun, -e, "const r = await fetch('http://127.0.0.1:4000/health'); process.exit(r.ok ? 0 : 1)"]
+    # bin/up --watch rebuilds the image when the source, manifest or lockfile changes.
+    develop:
+      watch:
+        - action: rebuild
+          path: services/backend/src
+        - action: rebuild
+          path: services/backend/package.json
+        - action: rebuild
+          path: services/backend/bun.lock
+    networks: [private]
+
+  # The React app and its Storybook as static files on nginx. The page calls
+  # the API from the browser: its origin is a build argument, set per slot in
+  # docker-compose.session.yml.
+  ui:
+    <<: *logging
+    build:
+      context: services/ui
+      target: runtime
+    healthcheck:
+      <<: *healthcheck
+      test: [CMD, wget, -q, --spider, "http://127.0.0.1:3000/"]
+    # bin/up --watch rebuilds the image on any change to the service.
+    develop:
+      watch:
+        - action: rebuild
+          path: services/ui
+          ignore: [node_modules/, coverage/, dist/, storybook-static/, tmp/, tests/, AGENTS.md]
+    networks: [private]
+
+volumes:
+  postgres-data:
+
+networks:
+  private:

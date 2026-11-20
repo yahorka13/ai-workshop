@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Regenerate every producer's contracts, then its consumers' generated types,
+# each in that service's pinned checks container.
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+usage: bin/contracts generate
+       bin/contracts --help
+
+Regenerate, in this working copy, every service's contracts and generated
+types: each service whose package.json has a contracts:generate script runs it
+in its Dockerfile's checks target, and every folder it reports with a
+"generated: <folder>" line replaces that folder in services/<service>/.
+
+Ownership: only a producer changes its contract, through its source (the
+backend's src/contracts/, for example). Generated files carry a notice and are
+never edited by hand; change the source and run bin/contracts generate.
+
+A consumer lists the producers whose contracts it reads in
+services/<service>/consumes.txt, one service name per line (# comments and
+blank lines allowed). Each declared producer's contracts/ folder is mounted
+read-only at /contracts/<producer>/ while the consumer generates.
+
+Flow: producers regenerate first, then every consumer that declares them, so a
+consumer's types come from the producer's fresh contracts. A cycle between
+declarations, a failing generation or a reported folder outside the service
+stops the run; that service's folders are left as they were. Then review and
+commit the changed files: bin/check <service> verifies that the committed
+files match what generation produces.
+
+Requires Docker with a running daemon. No host Bun/Node, running stack,
+credentials or network is needed: generation runs with --network none.
+Temporary Docker resources are isolated per invocation and removed on exit.
+HELP
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = --help ]; then usage; exit 0; fi
+if [ "$#" -ne 1 ] || [ "$1" != generate ]; then usage >&2; exit 2; fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=bin/consumes.sh
+. "$root/bin/consumes.sh"
+
+# Services with a contracts:generate script, each with its declared producers
+# (space separated, at the same index).
+services=()
+producers=()
+for manifest in "$root"/services/*/package.json; do
+  [ -f "$manifest" ] || continue
+  grep -q '"contracts:generate"' "$manifest" || continue
+  service="${manifest%/package.json}"
+  service="${service##*/}"
+  context="$root/services/$service"
+  if [[ ! "$service" =~ ^[a-z][a-z0-9-]*$ ]] || [ "$(cd "$context" && pwd -P)" != "$context" ]; then
+    echo "Unsafe service path: services/$service" >&2
+    exit 1
+  fi
+  load_consumes "$root" "$service" || exit 1
+  services+=("$service")
+  producers+=("${CONSUMES_PRODUCERS[*]-}")
+done
+if [ "${#services[@]}" -eq 0 ]; then
+  echo "No service has a contracts:generate script" >&2
+  exit 1
+fi
+
+# Order the services so every declared producer that also generates comes
+# before its consumers. Bash 3.2 has no associative arrays: repeatedly place
+# the first service, in name order, whose generating producers are all placed.
+ordered=" "
+order=()
+while [ "${#order[@]}" -lt "${#services[@]}" ]; do
+  progress=0
+  for index in "${!services[@]}"; do
+    service="${services[$index]}"
+    case "$ordered" in *" $service "*) continue ;; esac
+    ready=1
+    for producer in ${producers[$index]}; do
+      case " ${services[*]} " in *" $producer "*) ;; *) continue ;; esac
+      case "$ordered" in *" $producer "*) ;; *) ready=0 ;; esac
+    done
+    [ "$ready" -eq 1 ] || continue
+    order+=("$service")
+    ordered="$ordered$service "
+    progress=1
+    break
+  done
+  if [ "$progress" -eq 0 ]; then
+    stuck=""
+    for service in "${services[@]}"; do
+      case "$ordered" in *" $service "*) ;; *) stuck="$stuck $service" ;; esac
+    done
+    echo "consumes.txt declarations form a cycle between:$stuck" >&2
+    exit 1
+  fi
+done
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is not installed or not on PATH" >&2
+  exit 1
+fi
+mkdir -p "$root/tmp/contracts"
+work="$(mktemp -d "$root/tmp/contracts/run.$$.XXXXXX")"
+run="${work##*/run.}"
+run="${run//./_}"
+images=()
+containers=()
+
+cleanup() {
+  local status=$? name
+  trap - EXIT INT TERM
+  for name in ${containers[@]+"${containers[@]}"}; do
+    if ! docker rm -f "$name" >/dev/null 2>&1; then
+      echo "cleanup failed for container $name" >&2
+      [ "$status" -ne 0 ] || status=1
+    fi
+  done
+  for name in ${images[@]+"${images[@]}"}; do
+    if ! docker image rm "$name" >/dev/null 2>&1; then
+      echo "cleanup failed for image $name" >&2
+      [ "$status" -ne 0 ] || status=1
+    fi
+  done
+  rm -rf "$work"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# valid_root SERVICE ROOT: ROOT is a relative path of plain segments, none `.`
+# or `..`, and no existing prefix of it is a symbolic link out of the service.
+valid_root() {
+  local context="$root/services/$1" path="$2" prefix="" segment
+  [[ "$path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || return 1
+  while [ -n "$path" ]; do
+    segment="${path%%/*}"
+    [ "$segment" != . ] && [ "$segment" != .. ] || return 1
+    prefix="$prefix/$segment"
+    [ ! -L "$context$prefix" ] || return 1
+    if [ "$segment" = "$path" ]; then path=""; else path="${path#*/}"; fi
+  done
+}
+
+# replace SERVICE ROOT CONTAINER: copy the container's /app/ROOT into a scratch
+# folder, then swap it in, so a failed copy leaves the service's ROOT intact.
+replace() {
+  local service="$1" path="$2" container="$3" target fresh old
+  target="$root/services/$service/$path"
+  fresh="$work/$service.$((${#updated[@]})).new"
+  old="$work/$service.$((${#updated[@]})).old"
+  mkdir "$fresh" || return 1
+  docker cp "$container:/app/$path/." "$fresh" || return 1
+  mkdir -p "$(dirname "$target")"
+  if [ -e "$target" ]; then mv "$target" "$old" || return 1; fi
+  if ! mv "$fresh" "$target"; then
+    if [ -e "$old" ]; then mv "$old" "$target"; fi
+    return 1
+  fi
+  rm -rf "$old"
+}
+
+summary=()
+for service in "${order[@]}"; do
+  context="$root/services/$service"
+  image="factory-contracts:$service-$run"
+  container="factory-contracts-$service-$run"
+  load_consumes "$root" "$service" || exit 1
+  echo "$service: build"
+  images+=("$image")
+  if ! docker build --target checks -t "$image" "$context"; then
+    echo "$service: build failed" >&2
+    exit 1
+  fi
+  containers+=("$container")
+  if ! docker create --name "$container" --network none --workdir /app \
+    ${CONSUMES_MOUNTS[@]+"${CONSUMES_MOUNTS[@]}"} "$image" bun run contracts:generate >/dev/null; then
+    echo "$service: create failed" >&2
+    exit 1
+  fi
+  echo "$service: generate"
+  log="$work/$service.log"
+  if ! docker start -a "$container" > "$log" 2>&1; then
+    cat "$log"
+    echo "$service: generation failed; nothing was copied back for $service" >&2
+    exit 1
+  fi
+  cat "$log"
+  roots=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "generated: "*) ;; *) continue ;; esac
+    path="${line#generated: }"
+    if ! valid_root "$service" "$path"; then
+      echo "$service: refusing generated folder '$path': not a relative path inside services/$service; nothing was copied back for $service" >&2
+      exit 1
+    fi
+    roots+=("$path")
+  done < "$log"
+  if [ "${#roots[@]}" -eq 0 ]; then
+    echo "$service: contracts:generate reported no generated folder" >&2
+    exit 1
+  fi
+  updated=()
+  for path in "${roots[@]}"; do
+    if ! replace "$service" "$path" "$container"; then
+      echo "$service: copying $path back failed; services/$service/$path is unchanged" >&2
+      exit 1
+    fi
+    updated+=("$path")
+  done
+  summary+=("$service: ${updated[*]}")
+done
+
+echo
+echo "Updated generated folders:"
+printf '  %s\n' "${summary[@]}"
+echo "Review and commit them; bin/check <service> verifies them."

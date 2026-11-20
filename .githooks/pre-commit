@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Add the missing final newline to staged text files, then reject what is left.
+# Generated output often lacks one, so fixing it here keeps every tool's files
+# conforming without a per-service script. Installed by bin/setup-git-hooks.sh.
+#
+# CI enforces the rule regardless: a commit made with --no-verify still fails
+# the eof-newline check.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+while IFS= read -r -d '' path; do
+  # Only files still staged as text, and only when the staged content is what
+  # is on disk, so a partially staged file is never silently completed.
+  [ -f "$path" ] || continue
+  git diff --quiet -- "$path" || continue
+  [ -n "$(tail -c1 "$path")" ] || continue
+  grep -Iq . "$path" 2>/dev/null || continue
+  printf '\n' >> "$path"
+  git add -- "$path"
+  echo "pre-commit: added the missing final newline to $path"
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+
+git diff --cached --name-only -z --diff-filter=ACMR | xargs -0 bin/check-eof-newline.sh --staged
+
+# No path into one person's home directory in the files every agent reads.
+bin/check-home-paths.sh --staged
+
+# One obligation per requirement, only when the commit stages a spec file.
+# Asked of git directly: a pipe into grep -q fails on a long list (SIGPIPE).
+if ! git diff --cached --quiet -- openspec/; then
+  bin/check-spec-obligations.sh
+fi

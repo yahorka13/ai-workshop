@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Print a PR's ## Proof section from the proof files committed at a ref.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<'HELP'
+usage: bin/proof-markdown <ref>
+
+Prints a "## Proof" section for the pull request: for each proof the branch
+adds since its merge base with origin/main, in an OpenSpec change's proof/
+folder at <ref>, active or archived, a heading with
+its scenario, the outcome the spec expects, an inline image for the screenshot
+(.png, .jpg, .gif) and a link for the video (.webm, .mp4). A file named after
+its scenario ID (app-shell-c88136-....png, as bin/e2e --proof names them) is
+captioned from that scenario in openspec/specs/ or an active change at <ref>,
+so a reviewer knows whether a screen showing an error is the expected one.
+Each link is a commit permalink in the repository bin/repo names, so it keeps
+working after archiving moves the folder.
+Push <ref> first; paste the output into the PR body (work-pr does this).
+
+The proof files come from bin/e2e --proof.
+HELP
+}
+
+case "$#:${1:-}" in
+  1:--help) usage; exit 0 ;;
+  1:*) REF="$1" ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+SHA="$(git rev-parse --verify --quiet "$REF^{commit}")" || { echo "proof-markdown: not a commit: $REF" >&2; exit 2; }
+REPO_URL="https://github.com/$("$HERE/repo")" || exit 1
+# Only the branch's own proof: the files it adds since its merge base with
+# origin/main. An archived move counts as added, since main never had the path.
+BASE="$(git merge-base origin/main "$SHA" 2> /dev/null)" \
+  || { echo "proof-markdown: no merge base with origin/main; run git fetch origin main" >&2; exit 1; }
+FILES="$(git diff --name-only --no-renames --diff-filter=A "$BASE" "$SHA" -- openspec/changes \
+  | grep -E '^openspec/changes/([^/]+|archive/[^/]+)/proof/[^/]+\.(png|jpg|gif|webm|mp4)$' || true)"
+if [ -z "$FILES" ]; then
+  echo "proof-markdown: the branch adds no proof files in openspec/changes/*/proof/ at $REF; capture them with bin/e2e --proof and commit them" >&2
+  exit 1
+fi
+
+# scenario <id>: print "<title>" then "Expected: <THEN and AND lines>" for the
+# scenario with that ID at the ref, from the main spec or an active change.
+scenario() {
+  local id="$1" capability="${1%-*}" path
+  for path in "openspec/specs/$capability/spec.md" \
+    $(git ls-tree -r --name-only "$SHA" -- openspec/changes | grep -E "^openspec/changes/[^/]+/specs/$capability/spec\.md$" | grep -v '^openspec/changes/archive/' || true); do
+    git show "$SHA:$path" 2> /dev/null | awk -v head="#### Scenario: [$id] " '
+      index($0, head) == 1 { print substr($0, length(head) + 1); on = 1; next }
+      on && (/^#/ || /^[[:space:]]*$/) { exit }
+      on && /^- \*\*THEN\*\*/ { then = 1 }
+      on && then && /^- \*\*(THEN|AND)\*\*/ { sub(/^- /, ""); expected = expected (expected ? " " : "") $0 }
+      END { if (on) print "Expected: " expected }' | grep . && return 0
+  done
+  return 1
+}
+
+# scenario_id_of <file name>: the scenario ID a proof file is named after. A
+# name is "<id>-<test title>", and the ID ends in a 6-hex hash, so
+# "widgets-beefed-facade-x" could split more than one way: the first prefix
+# that names a scenario at the ref wins.
+scenario_id_of() {
+  local name="$1" prefix="" token
+  local -a tokens
+  IFS=- read -r -a tokens <<< "$name"
+  for token in "${tokens[@]}"; do
+    prefix="${prefix:+$prefix-}$token"
+    [[ "$prefix" == *-* ]] || continue
+    [[ "$token" =~ ^[0-9a-f]{6}$ ]] && [[ "$token" =~ [a-f] ]] || continue
+    scenario "$prefix" > /dev/null && { echo "$prefix"; return 0; }
+  done
+  return 1
+}
+
+echo '## Proof'
+echo
+# One entry per proof: a screenshot and its video share a name.
+for stem in $(printf '%s\n' "$FILES" | sed -E 's/\.[a-z0-9]+$//' | sort -u); do
+  name="$(basename "$stem")"
+  id="$(scenario_id_of "$name" || true)"
+  caption=""
+  [ -z "$id" ] || caption="$(scenario "$id" || true)"
+  if [ -n "$caption" ]; then
+    printf '### [%s] %s\n\n%s\n\n' "$id" "$(head -1 <<< "$caption")" "$(tail -1 <<< "$caption")"
+  else
+    printf '### %s\n\n' "$name"
+  fi
+  while IFS= read -r file; do
+    [ "${file%.*}" = "$stem" ] || continue
+    url="$REPO_URL/blob/$SHA/$file?raw=true"
+    case "$file" in
+      *.webm | *.mp4) printf '[Video](%s)\n\n' "$url" ;;
+      *) printf '![%s](%s)\n\n' "$name" "$url" ;;
+    esac
+  done <<< "$FILES"
+done

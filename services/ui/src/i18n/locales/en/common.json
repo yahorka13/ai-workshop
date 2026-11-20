@@ -1,0 +1,49 @@
+{
+  "app": {
+    "name": "Factory"
+  },
+  "nav": {
+    "label": "Main",
+    "dashboard": "Dashboard"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "lead": "Who has joined {{name}}.",
+    "totalUsers": "Total users",
+    "weekSignUps": "Sign-ups, last 7 days",
+    "chart": "Sign-ups per day",
+    "signUps": "Sign-ups",
+    "loading": "Loading…",
+    "failed": "Couldn't load the dashboard.",
+    "retry": "Reload to try again."
+  },
+  "notFound": {
+    "title": "Page not found",
+    "body": "There is no page at this address.",
+    "home": "Go to home"
+  },
+  "error": {
+    "title": "Something went wrong",
+    "body": "This page failed to load. Reload to try again.",
+    "reload": "Reload",
+    "home": "Go to home"
+  },
+  "api": {
+    "checking": "Checking API",
+    "online": "API online",
+    "offline": "API offline",
+    "unconfigured": "API not configured"
+  },
+  "login": {
+    "title": "Sign in",
+    "email": "Email",
+    "password": "Password",
+    "submit": "Sign in",
+    "submitting": "Signing in…",
+    "invalid": "Wrong email or password.",
+    "failed": "Couldn't reach the server. Try again."
+  },
+  "account": {
+    "signOut": "Sign out"
+  }
+}

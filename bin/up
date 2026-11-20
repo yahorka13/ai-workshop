@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Start this worktree's stack in its own session slot and wait until it is healthy.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/up [--watch]
+
+Writes .env when the checkout has none (bin/setup-env.sh), removes the stacks
+of deleted worktrees (bin/session reap), claims this worktree's session slot
+(registered in ~/.factory/sessions, see bin/session --help), writes
+.env.session, starts the stack in the background, waits until every service
+with a health check is healthy, creates the demo user (bin/seed --help) and
+prints its URLs. Safe to run again: the worktree keeps its slot, ports and
+data.
+
+  --watch   then stay attached to a Compose watch, which syncs or rebuilds a
+            service when the paths it watches change; Ctrl-C stops watching
+            and leaves the stack running. With no service that watches a path,
+            it says so and exits.
+
+Needs Docker running with Compose 2.22 or newer; bin/doctor checks the machine.
+Environment:
+  FACTORY_PUBLIC_HOST  host printed in URLs (default 127.0.0.1)
+  FACTORY_BIND_HOST    address ports are published on (default 127.0.0.1)
+  FACTORY_ALLOW_WILDCARD_BIND  set to 1 to allow 0.0.0.0, :: or [::] as the
+                       bind host; without it they are refused
+  FACTORY_SESSION_SLOTS, FACTORY_SESSION_REGISTRY: see bin/session --help
+These, when not exported, are read from ~/.factory/env.
+
+Related: bin/logs <service>, bin/stop (keeps data), bin/down (removes everything).
+HELP
+  exit 0
+fi
+
+WATCH=0
+case "$#:${1:-}" in
+  0:) ;;
+  1:--watch) WATCH=1 ;;
+  *) echo "Unknown arguments: $*. Run bin/up --help" >&2; exit 2 ;;
+esac
+
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT="$(cd "$BIN/.." && pwd -P)"
+SESSION_FILE="$ROOT/.env.session"
+MACHINE_ENV="$HOME/.factory/env"
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+# Reads NAME from the machine env file unless it is exported.
+load_env_value() {
+  local value
+  [ -z "${!1:-}" ] || return 0
+  [ -f "$MACHINE_ENV" ] || return 0
+  value="$(sed -n "s/^$1=//p" "$MACHINE_ENV" | tail -n 1)"
+  [ -z "$value" ] || export "$1=$value"
+}
+
+# A value as Compose reads it from the session file: a trailing " # comment"
+# and one pair of quotes are not part of it.
+plain_value() {
+  printf '%s' "$1" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/"
+}
+
+# True for an address that publishes on every interface: 0.0.0.0, ::, and
+# every other spelling of them (all zeros, bracketed, IPv4-mapped).
+is_wildcard() {
+  local host="${1#[}"
+  host="${host%]}"
+  case "$host" in
+    ::ffff:0.0.0.0 | ::FFFF:0.0.0.0) return 0 ;;
+    '' | *[!0:.]*) return 1 ;;
+  esac
+}
+
+command -v docker > /dev/null 2>&1 || die "docker is not installed. Install OrbStack or Docker Desktop (macOS), Docker Engine (Linux) or Docker Desktop with WSL integration (WSL); bin/doctor checks the rest."
+docker info > /dev/null 2>&1 || die "Docker is not running. Start it and run bin/up again."
+load_env_value FACTORY_PUBLIC_HOST
+load_env_value FACTORY_BIND_HOST
+load_env_value FACTORY_ALLOW_WILDCARD_BIND
+FACTORY_PUBLIC_HOST="$(plain_value "${FACTORY_PUBLIC_HOST:-}")"
+FACTORY_BIND_HOST="$(plain_value "${FACTORY_BIND_HOST:-}")"
+FACTORY_ALLOW_WILDCARD_BIND="$(plain_value "${FACTORY_ALLOW_WILDCARD_BIND:-}")"
+
+# A wildcard publishes Postgres, the API and the demo login to every network
+# the machine is on; only an explicit override allows it.
+if is_wildcard "${FACTORY_BIND_HOST:-}"; then
+  [ "${FACTORY_ALLOW_WILDCARD_BIND:-}" = 1 ] \
+    || die "FACTORY_BIND_HOST=$FACTORY_BIND_HOST publishes the stack (Postgres, the API and the demo login) on every network interface. Bind to 127.0.0.1 or a private network address (bin/up --help), or set FACTORY_ALLOW_WILDCARD_BIND=1 to publish it anyway."
+  echo "WARNING: FACTORY_BIND_HOST=$FACTORY_BIND_HOST publishes the stack on every network interface (FACTORY_ALLOW_WILDCARD_BIND=1)." >&2
+fi
+
+"$BIN/setup-env.sh" > /dev/null
+# Orca can remove a workspace without its archive hook: free what it left first.
+"$BIN/session" reap
+SLOT="$("$BIN/session" claim "$ROOT")"
+PROJECT="factory-$SLOT"
+PUBLIC_HOST="${FACTORY_PUBLIC_HOST:-127.0.0.1}"
+BIND_HOST="${FACTORY_BIND_HOST:-127.0.0.1}"
+PORTS="$("$BIN/session" ports "$SLOT")"
+port() { printf '%s\n' "$PORTS" | sed -n "s/^FACTORY_PORT_$1=//p"; }
+env_value() { sed -n "s/^$1=//p" "$ROOT/.env" | tail -n 1; }
+
+(
+  umask 077
+  {
+    echo "# Written by bin/up for session $SLOT and removed by bin/down. Do not edit or commit."
+    echo "FACTORY_SESSION_ID=$SLOT"
+    echo "COMPOSE_PROJECT_NAME=$PROJECT"
+    echo "$PORTS"
+    echo "FACTORY_PUBLIC_HOST=$PUBLIC_HOST"
+    echo "FACTORY_BIND_HOST=$BIND_HOST"
+  } > "$SESSION_FILE"
+)
+chmod 600 "$SESSION_FILE"
+
+LABEL="label=com.docker.compose.project=$PROJECT"
+echo "Starting session $SLOT ($PROJECT)..."
+# --build: images carry session values (the UI's API origin), and a source edit
+# made without --watch must show up; unchanged layers come from the cache.
+if ! "$BIN/compose" up -d --build --wait --wait-timeout 300 --remove-orphans; then
+  if [ -z "$(docker ps -aq --filter "$LABEL")" ] && [ -z "$(docker volume ls -q --filter "$LABEL")" ]; then
+    "$BIN/session" release "$SLOT" "$ROOT"
+    rm -f "$SESSION_FILE"
+    die "the stack did not start and nothing is running, so slot $SLOT was released. Fix the error above and run bin/up again."
+  fi
+  for service in $(docker ps -a --filter "$LABEL" --format '{{.Label "com.docker.compose.service"}} {{.State}} {{.Status}}' \
+    | awk '$2 != "running" || /unhealthy/ { print $1 }' | sort -u); do
+    echo "--- last 50 log lines of $service ---" >&2
+    "$BIN/compose" logs --tail 50 "$service" >&2 || true
+  done
+  die "the stack is not healthy. Slot $SLOT is kept: read more with bin/logs <service>, then run bin/up again, or bin/down to remove the stack."
+fi
+
+# One line per published service the stack defines; never a password.
+SERVICES=" $("$BIN/compose" config --services 2> /dev/null | tr '\n' ' ') "
+# Every local stack has the demo user (bin/seed --help).
+case "$SERVICES" in
+  *" backend "*) "$BIN/seed" || die "the stack is up but seeding failed: run bin/seed to see why" ;;
+esac
+echo "Session $SLOT ($PROJECT) is up"
+case "$SERVICES" in *" ui "*) echo "  UI        http://$PUBLIC_HOST:$(port UI)" ;; esac
+case "$SERVICES" in *" backend "*) echo "  GraphQL   http://$PUBLIC_HOST:$(port API)/graphql" ;; esac
+case "$SERVICES" in *" postgres "*) echo "  Postgres  postgres://$(env_value POSTGRES_USER)@$PUBLIC_HOST:$(port POSTGRES)/$(env_value POSTGRES_DB)" ;; esac
+echo "Logs: bin/logs <service>   Stop: bin/stop   Remove: bin/down"
+
+if [ "$WATCH" -eq 1 ]; then
+  if ! "$BIN/compose" config 2> /dev/null | grep -q '^ *develop:'; then
+    echo "Nothing to watch yet: no service of the stack watches a path."
+    exit 0
+  fi
+  exec "$BIN/compose" watch
+fi

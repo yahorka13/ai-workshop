@@ -1,0 +1,134 @@
+import js from "@eslint/js";
+import comments from "@eslint-community/eslint-plugin-eslint-comments";
+import ts from "typescript-eslint";
+
+export default [
+  {
+    ignores: [
+      "node_modules/**",
+      "playwright-report/**",
+      "test-results/**",
+      "proof/**",
+    ],
+  },
+  { linterOptions: { reportUnusedDisableDirectives: "error" } },
+  js.configs.recommended,
+  ...ts.configs.strictTypeChecked,
+  ...ts.configs.stylisticTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    plugins: { "eslint-comments": comments }, // @eslint-community/eslint-plugin-eslint-comments
+    rules: {
+      "@typescript-eslint/explicit-module-boundary-types": "error",
+      "@typescript-eslint/explicit-function-return-type": [
+        "error",
+        {
+          allowExpressions: true,
+          allowTypedFunctionExpressions: true,
+          allowHigherOrderFunctions: true,
+          allowDirectConstAssertionInArrowFunctions: true,
+        },
+      ],
+      "@typescript-eslint/no-unsafe-type-assertion": "error",
+      "@typescript-eslint/strict-boolean-expressions": [
+        "error",
+        { allowString: false, allowNumber: false, allowNullableObject: true },
+      ],
+      "@typescript-eslint/switch-exhaustiveness-check": [
+        "error",
+        {
+          considerDefaultExhaustiveForUnions: false,
+          requireDefaultForNonUnion: true,
+        },
+      ],
+      "@typescript-eslint/method-signature-style": ["error", "property"],
+      "@typescript-eslint/consistent-type-imports": [
+        "error",
+        { fixStyle: "inline-type-imports" },
+      ],
+      "@typescript-eslint/no-import-type-side-effects": "error",
+      "@typescript-eslint/consistent-type-definitions": ["error", "type"],
+      "@typescript-eslint/restrict-template-expressions": [
+        "error",
+        { allowNumber: true },
+      ],
+      "@typescript-eslint/no-confusing-void-expression": [
+        "error",
+        { ignoreArrowShorthand: true },
+      ],
+      "@typescript-eslint/no-misused-spread": "error",
+      "@typescript-eslint/no-unnecessary-type-conversion": "error",
+      "@typescript-eslint/ban-ts-comment": [
+        "error",
+        { "ts-expect-error": "allow-with-description" },
+      ],
+      eqeqeq: ["error", "always"],
+      "eslint-comments/require-description": "error",
+      "eslint-comments/no-unlimited-disable": "error",
+    },
+  },
+  {
+    // JavaScript has no syntax for return types.
+    files: ["**/*.{js,mjs,cjs}"],
+    rules: {
+      "@typescript-eslint/explicit-function-return-type": "off",
+      "@typescript-eslint/explicit-module-boundary-types": "off",
+    },
+  },
+  {
+    // Black-box: tests reach the system over HTTP only, never through another
+    // service's code.
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        { patterns: ["../*", "**/services/**"] },
+      ],
+    },
+  },
+  // lint-limits:start: the same in every service (bin/tests/lint-limits.test.sh)
+  {
+    rules: {
+      complexity: ["error", 10],
+      "max-depth": ["error", 3],
+      "max-params": ["error", 3],
+      "max-lines-per-function": [
+        "error",
+        { max: 50, skipBlankLines: true, skipComments: true },
+      ],
+      "max-lines": [
+        "error",
+        { max: 300, skipBlankLines: true, skipComments: true },
+      ],
+    },
+  },
+  {
+    files: ["**/*.tsx"],
+    rules: {
+      "max-lines-per-function": [
+        "error",
+        { max: 80, skipBlankLines: true, skipComments: true },
+      ],
+      "max-lines": [
+        "error",
+        { max: 400, skipBlankLines: true, skipComments: true },
+      ],
+    },
+  },
+  {
+    files: ["tests/**", "**/*.stories.*"],
+    rules: {
+      "max-params": ["error", 4],
+      "max-lines-per-function": "off",
+      "max-lines": [
+        "error",
+        { max: 500, skipBlankLines: true, skipComments: true },
+      ],
+    },
+  },
+  // lint-limits:end
+];

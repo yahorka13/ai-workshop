@@ -1,0 +1,28 @@
+# Host ports for this worktree's session, from .env.session written by bin/up.
+# Ports live only here: Compose appends port lists across files, so a port in
+# another file would be published twice. The UI calls the API from the
+# browser, so each side names the other's slot URL: the ui is built with the
+# API's origin, and the backend allows the UI's origin.
+services:
+  ui:
+    build:
+      args:
+        VITE_API_URL: http://${FACTORY_PUBLIC_HOST}:${FACTORY_PORT_API}
+    ports:
+      - target: 3000
+        published: ${FACTORY_PORT_UI}
+        host_ip: ${FACTORY_BIND_HOST}
+  backend:
+    environment:
+      APP_URL: http://${FACTORY_PUBLIC_HOST}:${FACTORY_PORT_UI}
+      API_URL: http://${FACTORY_PUBLIC_HOST}:${FACTORY_PORT_API}
+      FACTORY_LOCAL_STACK: 1 # only bin/up's stack; the seed refuses without it
+    ports:
+      - target: 4000
+        published: ${FACTORY_PORT_API}
+        host_ip: ${FACTORY_BIND_HOST}
+  postgres:
+    ports:
+      - target: 5432
+        published: ${FACTORY_PORT_POSTGRES}
+        host_ip: ${FACTORY_BIND_HOST}

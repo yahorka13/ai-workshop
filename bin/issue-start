@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Claim a GitHub issue of this repository (bin/repo) for whoever starts work on
+# it; the /work skill runs it before breaking the issue down.
+set -euo pipefail
+
+LABEL='in progress'
+
+usage() {
+  cat <<EOF
+usage: bin/issue-start <issue> [--take-over]
+       bin/issue-start --help
+
+Make you (the gh login) the only assignee of <issue> in the repository bin/repo prints and label it
+"$LABEL", creating that label when the repository lacks it. Prints
+"Started by @<login>". Run again on an issue you already hold, it changes
+nothing.
+
+The issue is taken when it is labelled "$LABEL" and assigned to anyone but
+you, or assigned to anyone who is neither you nor its author. A taken issue is
+left unchanged and the command exits 3, naming who holds it: ask before taking
+it over, then rerun with --take-over.
+
+Exit status: 0 claimed, 2 usage error, 3 taken; any other failure is gh's.
+Needs gh signed in with access to that repository.
+EOF
+}
+
+[ "${1:-}" = --help ] && { usage; exit 0; }
+
+TAKE_OVER=false
+case "$#:${2:-}" in
+  1:) ;;
+  2:--take-over) TAKE_OVER=true ;;
+  *) usage >&2; exit 2 ;;
+esac
+ISSUE="$1"
+[[ "$ISSUE" =~ ^[1-9][0-9]*$ ]] || { usage >&2; exit 2; }
+
+# bin/repo prints the fix itself when there is no origin.
+REPO="$("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/repo")"
+
+ME="$(gh api user --jq .login)"
+AUTHOR="$(gh issue view "$ISSUE" -R "$REPO" --json author --jq .author.login)"
+ASSIGNEES="$(gh issue view "$ISSUE" -R "$REPO" --json assignees --jq '.assignees[].login')"
+LABELS="$(gh issue view "$ISSUE" -R "$REPO" --json labels --jq '.labels[].name')"
+
+# has_label: the repository has the label.
+has_label() {
+  local labels
+  labels="$(gh label list -R "$REPO" --json name --jq '.[].name' --limit 1000)" || return 1
+  grep -qxF -- "$LABEL" <<< "$labels"
+}
+
+IN_PROGRESS=false
+grep -qxF -- "$LABEL" <<< "$LABELS" && IN_PROGRESS=true
+
+OTHERS=() # assignees other than you, removed when you claim the issue
+TAKEN=false
+while IFS= read -r who; do
+  [ -n "$who" ] && [ "$who" != "$ME" ] || continue
+  OTHERS+=("$who")
+  if $IN_PROGRESS || [ "$who" != "$AUTHOR" ]; then TAKEN=true; fi
+done <<< "$ASSIGNEES"
+
+if $TAKEN && ! $TAKE_OVER; then
+  HOLDERS="$(printf '@%s, ' "${OTHERS[@]}")"
+  echo "Issue #$ISSUE is taken by ${HOLDERS%, }. Ask before taking it over, then rerun with --take-over." >&2
+  exit 3
+fi
+
+if [ ${#OTHERS[@]} -gt 0 ] || ! grep -qxF -- "$ME" <<< "$ASSIGNEES" || ! $IN_PROGRESS; then
+  if ! has_label; then
+    # Another claim may create the label between the listing and here: a
+    # failed creation is fine when the label exists now.
+    gh label create "$LABEL" -R "$REPO" --description "Someone has started /work on this issue" --color FBCA04 ||
+      has_label || exit 1
+  fi
+  EDIT=(issue edit "$ISSUE" -R "$REPO")
+  if [ ${#OTHERS[@]} -gt 0 ]; then EDIT+=(--remove-assignee "$(IFS=,; echo "${OTHERS[*]}")"); fi
+  gh "${EDIT[@]}" --add-assignee "$ME" --add-label "$LABEL" > /dev/null
+fi
+
+echo "Started by @$ME"

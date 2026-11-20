@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Merge a pull request of this repository (bin/repo) only when it is ready and
+# every check is green: the /factory coordinator's only way to merge.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: bin/factory-merge <pr>
+       bin/factory-merge --help
+
+Merge <pr>, in the repository bin/repo prints, with a merge commit and delete
+its branch, only when it is open, not a draft, mergeable, holds every commit of
+its base branch, and every check completed with success or was skipped. Only
+the head commit whose checks it read is merged. Prints "merged #<pr>" and
+exits 0.
+
+Otherwise it changes nothing, prints "not merged: <reason>" and exits 3:
+  not open         merged or closed already
+  draft            still a draft
+  conflicting      main must be merged into the branch first
+  behind <base>    the branch lacks commits of its base: merge the base in,
+                   so the checks run against it
+  checks pending   a check is still running, none is reported yet, or GitHub
+                   is still computing whether the branch merges
+  check failed: <name>   a check failed or was cancelled
+
+Only the /factory coordinator runs it, in automatic mode; /work workers never
+merge. Exit status: 0 merged, 3 not merged, 2 usage error; any other failure
+is gh's.
+EOF
+}
+
+[ "${1:-}" = --help ] && [ "$#" -eq 1 ] && { usage; exit 0; }
+[ "$#" -eq 1 ] && [[ "$1" =~ ^[1-9][0-9]*$ ]] || { usage >&2; exit 2; }
+PR="$1"
+
+# bin/repo prints the fix itself when there is no origin.
+REPO="$("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/repo")"
+
+refuse() {
+  echo "not merged: $1"
+  exit 3
+}
+
+IFS=$'\t' read -r STATE DRAFT MERGEABLE HEAD BASE < <(gh pr view "$PR" -R "$REPO" --json state,isDraft,mergeable,headRefOid,baseRefName \
+  --jq '[.state, (.isDraft | tostring), .mergeable, .headRefOid, .baseRefName] | @tsv')
+[ "$STATE" = OPEN ] || refuse 'not open'
+[ "$DRAFT" = false ] || refuse draft
+[ "$MERGEABLE" != CONFLICTING ] || refuse conflicting
+[ "$MERGEABLE" = MERGEABLE ] || refuse 'checks pending'
+
+# Checks that ran before the base moved never saw it: the worker merges the
+# base in and the checks run again.
+BEHIND="$(gh api "repos/$REPO/compare/$BASE...$HEAD" --jq .behind_by)"
+[ "$BEHIND" = 0 ] || refuse "behind $BASE"
+
+# gh exits non-zero while a check fails or is pending, and when none is
+# reported; the lines it prints decide.
+CHECKS="$(gh pr checks "$PR" -R "$REPO" --json name,bucket --jq '.[] | [.bucket, .name] | @tsv' 2> /dev/null || true)"
+[ -n "$CHECKS" ] || refuse 'checks pending'
+FAILED="$(awk -F '\t' '$1 == "fail" || $1 == "cancel" { print $2; exit }' <<< "$CHECKS")"
+[ -z "$FAILED" ] || refuse "check failed: $FAILED"
+! awk -F '\t' '$1 != "pass" && $1 != "skipping" { found = 1 } END { exit !found }' <<< "$CHECKS" || refuse 'checks pending'
+
+# Only the commit whose checks were read: a push since then refuses the merge.
+gh pr merge "$PR" -R "$REPO" --merge --delete-branch --match-head-commit "$HEAD"
+echo "merged #$PR"

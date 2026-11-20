@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Docker Compose for this worktree's session: layered files, .env and .env.session.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/compose <docker compose arguments>
+
+Runs Docker Compose against this worktree's stack, for example:
+  bin/compose ps
+  bin/compose exec postgres psql -U app app
+
+Layers docker-compose.yml, docker-compose.local.yml (every local stack's
+limits) and docker-compose.session.yml (the session's published ports), and
+loads .env (bin/setup) and then .env.session (written by bin/up), so the
+project is the session's factory-<slot>. Fails without either file.
+
+FACTORY_BUILD_CACHE=gha also layers docker-compose.cache.yml, which builds
+every image with BuildKit's GitHub Actions cache. It is for CI only: it needs
+a Buildx builder that can reach the Actions cache service. Any other value
+fails; unset builds without it.
+HELP
+  exit 0
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+FILES=(-f "$ROOT/docker-compose.yml" -f "$ROOT/docker-compose.local.yml" -f "$ROOT/docker-compose.session.yml")
+case "${FACTORY_BUILD_CACHE:-}" in
+  "") ;;
+  gha) FILES+=(-f "$ROOT/docker-compose.cache.yml") ;;
+  *)
+    echo "FACTORY_BUILD_CACHE accepts only gha (the GitHub Actions cache, for CI), not: $FACTORY_BUILD_CACHE" >&2
+    exit 1
+    ;;
+esac
+if [ ! -f "$ROOT/.env.session" ]; then
+  echo "No session for this worktree — run bin/up" >&2
+  exit 1
+fi
+if [ ! -f "$ROOT/.env" ]; then
+  echo "No .env — run bin/setup" >&2
+  exit 1
+fi
+# The project name must reach Compose before it reads any file.
+COMPOSE_PROJECT_NAME="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$ROOT/.env.session")"
+export COMPOSE_PROJECT_NAME
+exec docker compose --project-directory "$ROOT" --env-file "$ROOT/.env" --env-file "$ROOT/.env.session" \
+  "${FILES[@]}" "$@"

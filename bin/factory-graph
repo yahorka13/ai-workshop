@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Read the open issues of a label into the dependency graph /factory works
+# through: which issues a worker may start now, and why the others wait.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: bin/factory-graph <label> [--json]
+       bin/factory-graph --help
+
+List the open issues of <label> in the repository bin/repo prints, one per
+line in issue-number order, as "<state> #<n> <title>". Changes nothing.
+
+A dependency is a body line "after: #<n>", exactly (as /crm-backlog writes
+them; a CRLF line ending counts too); closed dependencies are done. States, the first that applies:
+
+  untrusted  bin/issue-trust says the author cannot push, or cannot tell
+  taken      labelled "in progress": someone's /work holds it
+  cycle      on a dependency cycle among the open issues of the label
+  blocked    a dependency is still open, whatever its label, or does not
+             exist; listed as " after #a #b", a missing one as "#n (missing)"
+  ready      none of the above: a worker may start it
+
+--json prints the same records as a JSON array of
+{"number", "title", "state", "after"}, "after" holding the blocking
+dependencies as the strings printed above.
+
+Exit status: 0 listed, 2 usage error; any other failure is gh's.
+EOF
+}
+
+[ "${1:-}" = --help ] && [ "$#" -eq 1 ] && { usage; exit 0; }
+JSON=false
+case "$#:${2:-}" in
+  1:) ;;
+  2:--json) JSON=true ;;
+  *) usage >&2; exit 2 ;;
+esac
+LABEL="$1"
+case "$LABEL" in -*|'') usage >&2; exit 2 ;; esac
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# bin/repo prints the fix itself when there is no origin.
+REPO="$("$HERE/repo")"
+
+# One tab-separated line per open issue: number, in-progress flag, the numbers
+# of its exact "after: #<n>" lines, and the title, last because it may hold
+# anything but a newline. Empty fields are "-": read merges adjacent tabs.
+LISTING="$(gh issue list -R "$REPO" --label "$LABEL" --state open --limit 1000 \
+  --json number,title,body,labels \
+  --jq 'sort_by(.number)[] | [(.number | tostring),
+    (if any(.labels[]; .name == "in progress") then "taken" else "-" end),
+    ([(.body // "") | scan("(?m)^after: #([0-9]+)[ \t\r]*$") | .[0]] | join(" ") | if . == "" then "-" else . end),
+    .title] | @tsv')"
+
+NUMS=() TAKEN=() AFTERS=() TITLES=()
+while IFS=$'\t' read -r num taken afters title; do
+  [ -n "$num" ] || continue
+  [ "$taken" != - ] || taken=''
+  [ "$afters" != - ] || afters=''
+  NUMS+=("$num") TAKEN+=("$taken") AFTERS+=("$afters") TITLES+=("$title")
+done <<< "$LISTING"
+COUNT=${#NUMS[@]}
+
+# index_of <n>: the position of open issue <n> of the label, or nothing.
+index_of() {
+  local i
+  for ((i = 0; i < COUNT; i++)); do [ "${NUMS[$i]}" = "$1" ] && { echo "$i"; return; }; done
+}
+
+# Dependencies outside the label, looked up once each: "<n>:<STATE>" words.
+OUTSIDE=' '
+outside_state() {
+  local state
+  case "$OUTSIDE" in *" $1:"*) state="${OUTSIDE#* "$1":}"; echo "${state%% *}"; return ;; esac
+  state="$(gh issue view "$1" -R "$REPO" --json state --jq .state 2> /dev/null)" || state=MISSING
+  OUTSIDE="$OUTSIDE$1:$state "
+  echo "$state"
+}
+
+# on_cycle <i>: issue i reaches itself over open dependencies of the label.
+on_cycle() {
+  local start="${NUMS[$1]}" stack seen=' ' n j dep
+  stack="${AFTERS[$1]}"
+  while [ -n "${stack// /}" ]; do
+    n="${stack%% *}"
+    stack="${stack#"$n"}"; stack="${stack# }"
+    [ "$n" = "$start" ] && return 0
+    case "$seen" in *" $n "*) continue ;; esac
+    seen="$seen$n "
+    j="$(index_of "$n")"
+    [ -n "$j" ] || continue
+    for dep in ${AFTERS[$j]}; do stack="$stack $dep"; done
+  done
+  return 1
+}
+
+json_string() {
+  local s="${1//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+FIRST=true
+$JSON && printf '['
+for ((i = 0; i < COUNT; i++)); do
+  blockers=()
+  if ! "$HERE/issue-trust" "${NUMS[$i]}" > /dev/null 2>&1; then
+    state=untrusted
+  elif [ -n "${TAKEN[$i]}" ]; then
+    state=taken
+  elif on_cycle "$i"; then
+    state=cycle
+  else
+    for dep in ${AFTERS[$i]}; do
+      if [ -n "$(index_of "$dep")" ]; then
+        blockers+=("#$dep")
+      else
+        case "$(outside_state "$dep")" in
+          CLOSED) ;;
+          MISSING) blockers+=("#$dep (missing)") ;;
+          *) blockers+=("#$dep") ;;
+        esac
+      fi
+    done
+    if [ ${#blockers[@]} -gt 0 ]; then state=blocked; else state=ready; fi
+  fi
+
+  if $JSON; then
+    $FIRST || printf ','
+    printf '{"number":%s,"title":%s,"state":"%s","after":[' "${NUMS[$i]}" "$(json_string "${TITLES[$i]}")" "$state"
+    sep=''
+    for b in ${blockers[@]+"${blockers[@]}"}; do printf '%s%s' "$sep" "$(json_string "$b")"; sep=','; done
+    printf ']}'
+  else
+    line="$state #${NUMS[$i]} ${TITLES[$i]}"
+    [ ${#blockers[@]} -eq 0 ] || line="$line after ${blockers[*]}"
+    echo "$line"
+  fi
+  FIRST=false
+done
+if $JSON; then echo ']'; fi

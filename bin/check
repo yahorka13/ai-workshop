@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# Run the service-owned quality gates in its pinned checks container.
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+usage: bin/check <service>... [--gates <gate>[,<gate>...]]
+       bin/check --all [--gates <gate>[,<gate>...]]
+       bin/check --help
+
+Build the service Dockerfile's checks target and run contracts first, then
+lint, typecheck, coverage, duplicates, unused and imports at the same time, at
+/app. Contracts compares the service's generated contracts and consumer types
+with the committed files, so a stale file is reported before the type errors
+it causes, and its failure stops the check. A failed lint, typecheck,
+coverage, duplicates, unused or imports gate lets the others finish; the check
+then names every failed gate and its log. Each line a gate prints is prefixed
+<service>/<gate> | and each gate's own output is kept in <gate>.log. Coverage
+runs the unit and integration suites once, so a failing test fails the
+coverage phase and is named in its output. Duplicates fails on a block of code
+copied within the service's src/, tests/ or tooling/, at the threshold its
+.jscpd.json sets, naming both copies. Unused fails on an unused file, export,
+exported type or dependency, as its knip.config.ts sets, naming where it is.
+Imports fails on an import cycle or an import that breaks the service's layer
+rules in .dependency-cruiser.mjs, naming the rule and how to fix it.
+
+The gates run with no network beyond loopback, so a test fakes a provider at
+its contract instead of calling it; building the image keeps its network. A
+gate that failed on a network error is named with that reason.
+
+--gates runs only the named gates, contracts first: one or more of contracts,
+lint, typecheck, coverage, duplicates, unused, imports, comma separated.
+Coverage artifacts are collected only when coverage runs. For example,
+bin/check ui --gates contracts,typecheck checks a consumer against changed
+contracts without its test suites.
+
+Several services are checked at the same time, each by its own bin/check with
+FACTORY_JOBS divided evenly between them (at least 1 each); --all checks every
+service whose Dockerfile has a checks target. A failed service does not stop
+the others: the run ends with one "<service>: passed" or "<service>: failed"
+line per service, in the order given, and fails when any service failed.
+--gates applies to every service.
+
+A consumer lists the producers whose contracts it reads in
+services/<service>/consumes.txt, one service name per line (# comments and
+blank lines allowed). Each declared producer's contracts/ folder is mounted
+read-only at /contracts/<producer>/; a name that is not a service with a
+contracts/ folder fails the check before anything is built.
+
+FACTORY_JOBS sets how many parallel jobs the check uses: an exported value
+wins, else a FACTORY_JOBS=<n> line in ~/.factory/env (mode 600;
+FACTORY_ENV_FILE overrides the path), else the machine's cores (nproc, or
+sysctl -n hw.ncpu on macOS). One line in ~/.factory/env caps every worktree on
+the machine. It must be a positive integer.
+
+Requires Docker with a running daemon. No host Bun/Node, credentials or running
+Compose stack is required. Each service owns its package scripts and lockfile.
+Coverage and command output remain in tmp/check/<service>/<unique-run>/.
+Temporary Docker resources are isolated per invocation and removed on exit.
+HELP
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = --help ]; then usage; exit 0; fi
+all_gates="contracts lint typecheck coverage duplicates unused imports"
+invalid_gates() {
+  echo "--gates takes one or more of: contracts, lint, typecheck, coverage, duplicates, unused, imports, comma separated, given once" >&2
+  usage >&2
+  exit 2
+}
+services=()
+all=0
+selection=""
+selected=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --gates)
+      [ "$selected" -eq 0 ] && [ "$#" -ge 2 ] || invalid_gates
+      selection="$2"
+      selected=1
+      shift 2
+      ;;
+    --all)
+      if [ "$all" -eq 1 ]; then echo "--all is given once" >&2; usage >&2; exit 2; fi
+      all=1
+      shift
+      ;;
+    *)
+      services+=("$1")
+      shift
+      ;;
+  esac
+done
+gates="$all_gates"
+gate_args=()
+if [ "$selected" -eq 1 ]; then
+  case ",$selection," in *,,*) invalid_gates ;; esac
+  for name in ${selection//,/ }; do
+    case " $all_gates " in *" $name "*) ;; *) invalid_gates ;; esac
+  done
+  gates=""
+  for name in $all_gates; do
+    case ",$selection," in *",$name,"*) gates="$gates $name" ;; esac
+  done
+  gate_args=(--gates "$selection")
+fi
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if [ "$all" -eq 1 ]; then
+  if [ "${#services[@]}" -gt 0 ]; then
+    echo "--all takes no service names: ${services[*]}" >&2
+    usage >&2
+    exit 2
+  fi
+  for dockerfile in "$root"/services/*/Dockerfile; do
+    if grep -qE '^FROM .* AS checks$' "$dockerfile"; then
+      name="${dockerfile%/Dockerfile}"
+      services+=("${name##*/}")
+    fi
+  done
+  if [ "${#services[@]}" -eq 0 ]; then
+    echo "--all found no service whose Dockerfile has a checks target" >&2
+    exit 2
+  fi
+fi
+if [ "${#services[@]}" -eq 0 ]; then usage >&2; exit 2; fi
+
+# Exit 2 unless the name is a service folder of this repository.
+validate_service() {
+  local name="$1" context
+  if [[ ! "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then
+    echo "Invalid service name: $name" >&2
+    exit 2
+  fi
+  context="$root/services/$name"
+  if [ ! -d "$context" ] || [ "$(cd "$context" && pwd -P)" != "$context" ] || [ ! -f "$context/package.json" ] || [ ! -f "$context/Dockerfile" ]; then
+    echo "Unknown service or unsafe service path: $name" >&2
+    exit 2
+  fi
+}
+seen=" "
+for name in "${services[@]}"; do
+  validate_service "$name"
+  case "$seen" in *" $name "*) echo "Service named twice: $name" >&2; usage >&2; exit 2 ;; esac
+  seen="$seen$name "
+done
+
+# shellcheck source=bin/factory-jobs.sh
+. "$root/bin/factory-jobs.sh"
+resolve_factory_jobs
+
+# Several services: check each in its own bin/check at the same time, with an
+# even share of the jobs, and report every service's result.
+if [ "${#services[@]}" -gt 1 ]; then
+  share=$((FACTORY_JOBS / ${#services[@]}))
+  [ "$share" -ge 1 ] || share=1
+  children=()
+  # shellcheck disable=SC2329 # called from the INT and TERM traps
+  stop_children() {
+    local pid
+    for pid in ${children[@]+"${children[@]}"}; do kill -TERM "$pid" 2>/dev/null || true; done
+    for pid in ${children[@]+"${children[@]}"}; do wait "$pid" 2>/dev/null || true; done
+  }
+  trap 'stop_children; exit 130' INT
+  trap 'stop_children; exit 143' TERM
+  for name in "${services[@]}"; do
+    FACTORY_JOBS="$share" "${BASH_SOURCE[0]}" "$name" ${gate_args[@]+"${gate_args[@]}"} &
+    children+=("$!")
+  done
+  results=()
+  failed=0
+  i=0
+  for name in "${services[@]}"; do
+    if wait "${children[$i]}"; then results+=("$name: passed"); else results+=("$name: failed"); failed=1; fi
+    i=$((i + 1))
+  done
+  children=()
+  printf '%s\n' "${results[@]}"
+  exit "$failed"
+fi
+
+service="${services[0]}"
+context="$root/services/$service"
+# shellcheck source=bin/consumes.sh
+. "$root/bin/consumes.sh"
+load_consumes "$root" "$service" || exit 1
+if ! command -v docker >/dev/null 2>&1; then
+  echo "$service: build failed: Docker is not installed or not on PATH" >&2
+  exit 1
+fi
+mkdir -p "$root/tmp/check/$service"
+output="$(mktemp -d "$root/tmp/check/$service/run.$$.XXXXXX")"
+image="factory-check:${output##*/}"
+container="factory-check-$service-${output##*/}"
+command_pid=""
+logger_pid=""
+gate_pids=()
+reader_pids=()
+image_owned=0
+container_owned=0
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [ -n "$command_pid" ]; then
+    kill "$command_pid" 2>/dev/null || true
+    wait "$command_pid" 2>/dev/null || true
+  fi
+  if [ -n "$logger_pid" ]; then wait "$logger_pid" 2>/dev/null || true; fi
+  local pid
+  for pid in ${gate_pids[@]+"${gate_pids[@]}"} ${reader_pids[@]+"${reader_pids[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in ${gate_pids[@]+"${gate_pids[@]}"} ${reader_pids[@]+"${reader_pids[@]}"}; do
+    wait "$pid" 2>/dev/null || true
+  done
+  rm -f "$output/.stream" "$output"/.*.stream
+  if [ "$container_owned" -eq 1 ] && ! docker rm -f "$container" >/dev/null 2>&1; then
+    echo "$service: cleanup failed for container $container" >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
+  if [ "$image_owned" -eq 1 ] && ! docker image rm "$image" >/dev/null 2>&1; then
+    echo "$service: cleanup failed for image $image" >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+run_logged() {
+  local status=0
+  mkfifo "$output/.stream"
+  tee -a "$output/check.log" < "$output/.stream" &
+  logger_pid=$!
+  "$@" > "$output/.stream" 2>&1 &
+  command_pid=$!
+  wait "$command_pid" || status=$?
+  command_pid=""
+  wait "$logger_pid" || status=1
+  logger_pid=""
+  rm "$output/.stream"
+  return "$status"
+}
+
+phase() {
+  local name="$1"
+  shift
+  printf '%s: %s\n' "$service" "$name" | tee -a "$output/check.log"
+  if ! run_logged "$@"; then
+    echo "$service: $name failed; see $output/check.log" >&2
+    exit 1
+  fi
+}
+
+image_owned=1
+phase build docker build --target checks -t "$image" "$context"
+container_owned=1
+phase create docker create --name "$container" --network none --workdir /app -e "FACTORY_JOBS=$FACTORY_JOBS" ${CONSUMES_MOUNTS[@]+"${CONSUMES_MOUNTS[@]}"} "$image" bun -e 'setInterval(() => {}, 2147483647)'
+phase start docker start "$container"
+# Keep a gate's own output in <gate>.log, and print each line prefixed with
+# the service and gate, appending it to check.log. One streaming process per
+# step, not one per line: coverage prints tens of thousands of lines.
+prefix_gate() {
+  local gate="$1"
+  tee -a "$output/$gate.log" |
+    awk -v prefix="$service/$gate | " '{ print prefix $0; fflush() }' |
+    tee -a "$output/check.log"
+}
+
+# Run the given gates at the same time and let every one finish; name each
+# failed gate with its log and return nonzero when any failed.
+run_gates() {
+  local gate status failed="" i=0
+  for gate in "$@"; do
+    printf '%s: %s\n' "$service" "$gate" | tee -a "$output/check.log"
+    : > "$output/$gate.log"
+    mkfifo "$output/.$gate.stream"
+    prefix_gate "$gate" < "$output/.$gate.stream" &
+    reader_pids+=("$!")
+    docker exec "$container" bun run "$gate" > "$output/.$gate.stream" 2>&1 &
+    gate_pids+=("$!")
+  done
+  for gate in "$@"; do
+    status=0
+    wait "${gate_pids[$i]}" || status=$?
+    wait "${reader_pids[$i]}" || status=1
+    rm -f "$output/.$gate.stream"
+    [ "$status" -eq 0 ] || failed="$failed $gate"
+    i=$((i + 1))
+  done
+  gate_pids=()
+  reader_pids=()
+  for gate in $failed; do
+    echo "$service: $gate failed; see $output/$gate.log" >&2
+    if grep -qE 'EAI_AGAIN|ENETUNREACH|EHOSTUNREACH' "$output/$gate.log"; then
+      echo "$service: $gate tried to reach the network; checks run with no network on purpose: fake the provider at its contract" >&2
+    fi
+  done
+  [ -z "$failed" ]
+}
+
+# Contracts runs alone first: a stale contract explains later type errors.
+rest=""
+for gate in $gates; do
+  if [ "$gate" = contracts ]; then run_gates contracts || exit 1; else rest="$rest $gate"; fi
+done
+# shellcheck disable=SC2086 # one word per gate
+if [ -n "$rest" ]; then run_gates $rest || exit 1; fi
+case " $gates " in *" coverage "*) ;; *) exit 0 ;; esac
+phase artifacts mkdir "$output/coverage"
+phase artifacts docker cp "$container:/app/coverage/." "$output/coverage"
+if [ ! -s "$output/coverage/lcov.info" ]; then
+  echo "$service: artifacts failed: missing coverage/lcov.info" >&2
+  exit 1
+fi
+printf 'Check artifacts: %s\n' "$output"

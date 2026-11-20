@@ -1,0 +1,28 @@
+# One service's gates in its pinned checks container (bin/check --help).
+# checks.yml calls it once per service, as <service>-checks.
+name: Service check
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service folder under services/
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Service check (${{ inputs.service }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Run all service gates in its pinned container
+        run: bin/check "$SERVICE"
+        env:
+          SERVICE: ${{ inputs.service }}

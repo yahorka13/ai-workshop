@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "types": ["bun"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true,
+    "skipLibCheck": true
+  },
+  "include": [
+    "src/**/*",
+    "tests/**/*",
+    "tooling/**/*",
+    "eslint.config.mjs",
+    "drizzle.config.ts",
+    "knip.config.ts",
+    ".dependency-cruiser.mjs",
+    "stryker.config.mjs"
+  ]
+}

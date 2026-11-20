@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Orca archive hook: remove the workspace's stack and free its slot.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/orca-archive
+
+Orca's archive hook (see orca.yaml). Runs the workspace's own bin/down, which
+stops the stack's background watch, removes its containers, volumes, networks
+and built images and frees its slot,
+and exits with its status: an archive that could not remove the stack fails
+instead of leaking it. Start Docker and archive again. Each run appends a
+"started" and an "exited <status>" line to ~/.factory/orca-hooks.log; a
+removed workspace with no lines there was removed without this hook, and its
+stack is removed by bin/session reap or the next bin/up.
+
+Environment (set by Orca):
+  ORCA_WORKTREE_PATH  the workspace (default: the current directory)
+  FACTORY_ORCA_HOOK_LOG  the hook log (default: ~/.factory/orca-hooks.log)
+HELP
+  exit 0
+fi
+
+WORKTREE="${ORCA_WORKTREE_PATH:-$PWD}"
+# Appends one line to the hook log; a log that cannot be written is skipped.
+hook_log() {
+  local log="${FACTORY_ORCA_HOOK_LOG:-$HOME/.factory/orca-hooks.log}"
+  {
+    mkdir -p "$(dirname "$log")" \
+      && printf '%s %s %s slot=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" archive "$WORKTREE" "${1:--}" "$2" >> "$log"
+  } 2> /dev/null || true
+}
+session_slot() { sed -n 's/^FACTORY_SESSION_ID=//p' "$WORKTREE/.env.session" 2> /dev/null || true; }
+
+# Read before bin/down deletes the session file.
+SLOT="$(session_slot)"
+hook_log "$SLOT" started
+if [ ! -x "$WORKTREE/bin/down" ]; then
+  echo "ERROR: $WORKTREE/bin/down not found, so this workspace's stack cannot be removed. Check bin/session list." >&2
+  hook_log "$SLOT" 'exited 1'
+  exit 1
+fi
+cd "$WORKTREE"
+status=0
+"$WORKTREE/bin/down" || status=$?
+hook_log "$SLOT" "exited $status"
+exit "$status"

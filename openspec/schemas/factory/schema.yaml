@@ -1,0 +1,292 @@
+name: factory
+version: 1
+description: >
+  Software factory workflow - superpowers process, OpenSpec artifacts.
+  design (superpowers:brainstorming) → proposal → specs → tasks
+  (superpowers:writing-plans) → apply (superpowers execution).
+artifacts:
+  - id: design
+    generates: design.md
+    description: Design agreed through superpowers brainstorming
+    template: design.md
+    instruction: |
+      This artifact is produced by the superpowers brainstorming process.
+      Use the Skill tool to invoke **superpowers:brainstorming**, with the
+      change's GitHub issue as the starting idea: read it with
+      `gh issue view <N> -R "$(bin/repo)" --comments`, where <N> is the change
+      name's numeric prefix.
+
+      Overrides to the brainstorming skill (they win over its defaults):
+      - Output location: do NOT write to the superpowers default spec folder. The
+        approved design goes to this change's `design.md`, using the template
+        sections. Skip the brainstorming skill's own git commit; the change is
+        committed as a whole.
+      - Path classification:
+        - Spike: no change is needed. Stop, tell the user, and offer to
+          delete this change folder and post the answer on the issue.
+        - Bounded: present the short design in chat as usual. After approval,
+          still write a short design.md - the change needs it on record.
+        - Architectural: present the design in sections as usual. After
+          approval, write design.md and ask the user to review the file.
+      - Baseline backfill: list the capabilities this change touches (use the
+        capability list in the project context; check `openspec list --specs`).
+        For each one with no spec under openspec/specs/, present the CURRENT
+        behaviour of only the area this change touches - as requirements with
+        WHEN/THEN scenarios, sourced from the code - and get it approved as its
+        own section BEFORE presenting the new behaviour. Record it in
+        design.md's `## Baseline` section. Skip this when the touched area
+        has no code yet.
+      - Terminal state: STOP after design.md is written and approved. Do NOT
+        invoke superpowers:writing-plans - the tasks artifact does that.
+    requires: []
+
+  - id: proposal
+    generates: proposal.md
+    description: Initial proposal document outlining the change
+    template: proposal.md
+    instruction: |
+      Create the proposal document that establishes WHY this change is needed.
+
+      Read design.md first. The design brainstorm already explored the problem
+      and agreed the approach - extract from it, do not re-explore.
+
+      The first lines after the title are the change header (see template):
+      - `**Issue:** #<N>` - the issue number is the change name's prefix
+        (`1096-a3f9c1-referral-credits` → `#1096`).
+      - `**Type:** feature` when behaviour changes (has spec deltas), or
+        `**Type:** technical` for refactors, tooling and infra with no
+        behaviour change. A technical change MUST also set
+        `skip_specs: true` in its `.openspec.yaml`.
+      - `**Services:**` the affected services under `services/`.
+
+      Sections:
+      - **Why**: 1-2 sentences on the problem or opportunity. What problem does this solve? Why now?
+      - **What Changes**: Bullet list of changes. Be specific about new capabilities, modifications, or removals. Mark breaking changes with **BREAKING**.
+      - **Capabilities**: Identify which specs will be created or modified:
+        - **New Capabilities**: List capabilities being introduced. Each becomes a new `specs/<capability-path>/spec.md`. Name each capability for a durable system behavior (for example, `user-auth`), not the work in this change (for example, `add-login-endpoint`). Choose a cohesive boundary that can own related requirements as the system evolves; avoid broad catch-all capabilities. Use kebab-case for path segments you introduce (e.g., `user-auth` or `identity/user-auth`) and follow the project's existing spec organization.
+        - **Modified Capabilities**: List existing capabilities whose REQUIREMENTS are changing. Only include if spec-level behavior changes (not just implementation details). Each needs a delta spec file. Use the exact existing path under `openspec/specs/`. Leave empty if no requirement changes.
+      - **Impact**: Affected code, APIs, dependencies, or systems.
+
+      IMPORTANT: The Capabilities section is critical. It creates the contract between
+      proposal and specs phases. Research existing specs before filling this in:
+      run `openspec list --specs` for the project's capability inventory, then
+      `openspec show "<spec-id>" --type spec --json --no-scenarios` for any that
+      look related - that returns a capability's purpose and requirement texts
+      without pulling whole spec files into context. Append `--store "<id>"` to
+      both commands only for a registered standalone store, and keep `--type
+      spec`: a change and a spec sharing a name is otherwise an ambiguous-item
+      error. `openspec list` without `--specs` lists in-flight changes, not
+      specs - it never shows what the project already covers. Reuse an existing
+      capability's exact path instead of introducing a near-duplicate name.
+      The filtered read is only an overview. Before deciding what is already
+      covered or what should change, read each relevant spec in full, including
+      scenarios, with `openspec show "<spec-id>" --type spec` (same `--store` rule).
+      Each capability listed here will need a corresponding spec file.
+
+      Every change must either declare at least one capability (new or
+      modified) or explicitly opt out of specs: `openspec validate` rejects a
+      change with zero deltas unless the change's `.openspec.yaml` sets
+      `skip_specs: true`. Use `skip_specs: true` only when no spec-level
+      behavior changes (pure refactor, tooling, docs) - specs describe
+      behavior, so if behavior does not change, no spec should change either.
+      Do not invent a requirement just to satisfy validation.
+
+      Keep it concise (1-2 pages). Focus on the "why" not the "how" -
+      implementation details belong in design.md.
+
+      This is the foundation the specs and tasks build on.
+    requires:
+      - design
+
+  - id: specs
+    generates: "specs/**/*.md"
+    description: Detailed specifications for the change
+    template: spec.md
+    instruction: |
+      Create specification files that define WHAT the system should do.
+
+      Read specs one requirement at a time: `bin/spec show <scenario-id |
+      requirement name>` prints one requirement with its scenarios,
+      `bin/spec find <query>` finds where a rule lives, and `bin/spec changed`
+      lists what this branch changed in the specs. Do not read whole spec
+      files.
+
+      A spec is a behavior contract, not an implementation plan.
+
+      Good spec content:
+      - Observable behavior users or downstream systems rely on
+      - Inputs, outputs, and error conditions
+      - External constraints (security, privacy, reliability, compatibility)
+      - Scenarios that can be tested or explicitly validated
+
+      Avoid in specs:
+      - Internal class/function names
+      - Library or framework choices
+      - Step-by-step implementation details
+      - Detailed execution plans (those belong in design.md or tasks.md)
+
+      Quick test: if the implementation can change without changing externally
+      visible behavior, it likely does not belong in the spec.
+
+      Create one spec file per capability listed in the proposal's Capabilities section.
+      `<capability-path>` is the spec directory relative to `specs/` (for example,
+      `user-auth` or `identity/user-auth`). Preserve the full path:
+      - New capabilities: use the exact path from the proposal at `specs/<capability-path>/spec.md`. Any path segment newly introduced in the proposal must be kebab-case. Follow the project's existing organization; do not add a new domain level when the project uses a flat layout.
+      - Modified capabilities: use the exact existing path from `openspec/specs/<capability-path>/` when creating the delta at `specs/<capability-path>/spec.md`. Run `openspec list --specs` to confirm that path before writing the delta, appending `--store "<id>"` only for a registered standalone store - a mistyped or invented path targets a capability that does not exist rather than the one you meant. Do not move or rename the capability.
+
+      Write the spec files one at a time, so the user sees progress and an
+      interrupted run keeps the files it already wrote:
+      - Before writing anything, compare the capabilities the proposal lists
+        with the `specs/<capability-path>/spec.md` files that already exist,
+        and start with the first capability that has no file. Do not rewrite
+        an existing file unless the user asks you to.
+      - Before each file, say in one line which capability you are writing.
+      - Write each file as soon as you have drafted it. Do not plan every file
+        before writing the first.
+      - Stop when every capability the proposal lists has its file.
+
+      There must be at least one spec file unless the change's `.openspec.yaml`
+      sets `skip_specs: true` (no spec-level behavior change) - `openspec validate`
+      rejects a zero-delta change without that marker. If the proposal lists no
+      capabilities and `skip_specs` is not set, revisit the proposal first.
+
+      Delta operations (use ## headers):
+      - **ADDED Requirements**: New capabilities
+      - **MODIFIED Requirements**: Changed behavior - MUST include full updated content
+      - **REMOVED Requirements**: Deprecated features - MUST include **Reason** and **Migration**
+      - **RENAMED Requirements**: Name changes only - use FROM:/TO: format
+
+      Format requirements:
+      - Each requirement: `### Requirement: <name>` followed by description
+      - Use SHALL/MUST for normative requirements (avoid should/may)
+      - Each scenario: `#### Scenario: <name>` with WHEN/THEN format
+      - Each scenario name starts with a stable ID in brackets. A new
+        scenario takes its ID from `bin/scenario-id.sh <capability> [<count>]`,
+        e.g. `#### Scenario: [auth-3f9c1a] Expired token is rejected`. IDs
+        are always a hash, never a number, which parallel branches would
+        also take. IDs are never changed or reused: a MODIFIED requirement
+        keeps its scenarios' IDs. End-to-end tests reference them
+        (principle 14).
+      - **CRITICAL**: Scenarios MUST use exactly 4 hashtags (`####`). Using 3 hashtags or bullets will fail silently.
+      - Every requirement MUST have at least one scenario.
+      - Keep each requirement's description (the text between `### Requirement:` and its first scenario) to 500 characters or fewer. `openspec validate` flags longer descriptions in ADDED requirements and in the main spec. This is a warning: normal validation still passes, but `openspec validate --strict` fails on it. When writing a new requirement, state one behavior per requirement: move examples and edge cases into scenarios, and split a requirement that covers several behaviors into separate `### Requirement:` blocks, each with its own scenarios. Under MODIFIED, keep the existing requirement block whole; never split, trim or rewrite existing text just to meet the length. Split an existing long requirement only when the user asks for it, in a change made for that purpose: under MODIFIED, keep its header and every scenario and cut its description down to one behavior without changing its meaning, then add each behavior you removed as its own ADDED requirement with its own scenarios.
+
+      New capabilities only: the delta spec's first section is `## Purpose` -
+      one or two sentences (50+ characters, or `openspec validate --strict`
+      reports it as too brief) describing what the capability is for. Archive
+      copies it into the main spec it creates; without it the new main spec is
+      left with a `TBD ... Update Purpose after archive` placeholder to fill in
+      by hand. Do NOT add `## Purpose` to a delta for an existing capability -
+      that spec already has one and the delta's is ignored. To change an
+      existing capability's Purpose - including a leftover `TBD` placeholder -
+      edit `<planningHome.root>/openspec/specs/<capability-path>/spec.md`
+      directly. `planningHome.root` comes from the `openspec instructions ...
+      --json` response. Always use it rather than a repo-relative path: it
+      resolves to the store whenever the change lives in one - whether that
+      came from `--store`, a project `store:` pointer, or a global default
+      store - and to the current repository otherwise. Do not try to work out
+      which case applies; the field already has.
+
+      MODIFIED requirements workflow:
+      1. Locate the existing requirement in `<planningHome.root>/openspec/specs/<capability-path>/spec.md` (the same store-aware root as above)
+      2. Copy the ENTIRE requirement block (from `### Requirement:` through all scenarios)
+      3. Paste under `## MODIFIED Requirements` and edit to reflect new behavior
+      4. Ensure header text matches exactly (whitespace-insensitive)
+
+      Common pitfall: Using MODIFIED with partial content loses detail at archive time.
+      If adding new concerns without changing existing behavior, use ADDED instead.
+
+      Example (a new capability, so its first section is `## Purpose`):
+      ```
+      # Spec Delta
+
+      ## Purpose
+
+      Lets users take their data out of the product in a portable format.
+
+      ## ADDED Requirements
+
+      ### Requirement: User can export data
+      The system SHALL allow users to export their data in CSV format.
+
+      #### Scenario: Successful export
+      - **WHEN** user clicks "Export" button
+      - **THEN** system downloads a CSV file with all user data
+
+      ## REMOVED Requirements
+
+      ### Requirement: Legacy export
+      **Reason**: Replaced by new export system
+      **Migration**: Use new export endpoint at /api/v2/export
+      ```
+
+      Specs should be testable - each scenario is a potential test case.
+
+      Baseline backfill:
+      If design.md has a `## Baseline` section, write those approved
+      current-behaviour requirements first, as `## ADDED Requirements` in the
+      delta of the capability they belong to (with `## Purpose`, since the
+      capability is new to openspec/specs). A baseline requirement that this
+      change also alters is written once, in its NEW form - OpenSpec cannot
+      MODIFY a requirement ADDED by the same change. design.md's Baseline
+      section keeps the record of what the behaviour was before.
+
+      Capability names: use the list in the project context. Introduce a new
+      capability only when none of them fits, and say why in the proposal.
+    requires:
+      - proposal
+
+  - id: tasks
+    generates: tasks.md
+    description: Implementation plan written with superpowers writing-plans
+    template: tasks.md
+    instruction: |
+      This artifact is produced by the superpowers writing-plans process.
+      Use the Skill tool to invoke **superpowers:writing-plans**, with this
+      change's design.md, proposal.md and delta specs as the spec.
+
+      Overrides to the writing-plans skill (they win over its defaults):
+      - Output location: do NOT write to the superpowers default plan folder. Write the
+        plan to this change's `tasks.md`.
+      - Format: keep writing-plans' content (exact files, code, commands,
+        TDD steps, commit points) but shape it for OpenSpec tracking:
+        - Each task is a `## N. <task name>` heading.
+        - Each step is a checkbox `- [ ] N.M [<service>] <step>`, where
+          <service> is the folder under `services/` (or `repo` for root files).
+        - Code and commands go in fenced blocks under the step; checkboxes
+          inside fences are not tracked.
+        - Do not repeat the writing-plans header's Goal/Architecture -
+          point to design.md instead.
+      - Every scenario in the delta specs must be covered by at least one
+        test step, and every end-to-end test step names the scenario IDs it
+        covers. Write tests from the scenarios, not from the code. Tests are
+        written before the code they test.
+      - Commit steps use the subject `[<issue>][<hash>] <scope>: <Description>`
+        (both taken from the change name).
+      - Terminal state: STOP after tasks.md is written and the user has
+        reviewed it. Do NOT start execution - `/opsx:apply` does that.
+        Do not offer an execution choice: `/opsx:apply` always executes
+        inline.
+    requires:
+      - specs
+      - design
+
+apply:
+  requires: [ tasks ]
+  tracks: tasks.md
+  instruction: |
+    tasks.md is a superpowers plan. Execute it with superpowers, on the
+    current change branch (do not create a worktree):
+    1. Execute it inline with **superpowers:executing-plans**,
+       without asking for an execution method. Hand tasks.md to that
+       skill as the plan.
+    2. Follow **superpowers:test-driven-development** for every step that
+       changes behaviour.
+    3. Tick each checkbox (`- [x]`) in tasks.md as soon as its step is done.
+    4. Commit with the subject `[<issue>][<hash>] <scope>: <Description>`.
+    5. When all tasks are done, run every check from AGENTS.md → "Definition
+       of done" for each affected service, fix failures caused by this change,
+       and report pre-existing ones.
+    6. Prove the change on the running stack (AGENTS.md → "Definition of
+       done"), then apply **superpowers:verification-before-completion**.
+    Do NOT archive - archiving happens in `/work-pr` as the PR's last commit.

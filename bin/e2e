@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Run the services/e2e Playwright suite against this worktree's running stack.
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+usage: bin/e2e [-- <playwright args>]
+       bin/e2e --changed [-- <playwright args>]
+       bin/e2e --proof [--change <id>] [--video] [-- <playwright args>]
+       bin/e2e --gates
+       bin/e2e --help
+
+Builds services/e2e's image and runs its Playwright suite against the stack
+bin/up started for this worktree. The container joins the stack's own Compose
+network, and the suite's global setup forwards the slot's ports inside the
+container to the ui and the backend, so its browser opens the app and calls
+the API at the session's published URLs exactly as a developer's browser
+does: the CORS and origin checks are the real ones. No host networking is
+needed, so it runs the same on macOS, Linux and WSL. Arguments after -- pass
+through to `playwright test`, for example:
+
+  bin/e2e -- --grep "\[app-shell-af1ebe\]"
+
+Playwright's report and traces are kept in tmp/e2e/<run>/ and the path is
+printed; open playwright-report/index.html, or a trace.zip with Playwright's
+trace viewer. Exits with the suite's result.
+
+  --proof          also take a screenshot of every test and, when the suite
+                   passes, copy them into the change's proof/ folder, named
+                   after the test title with its scenario IDs first
+                   (app-shell-c88136-an-unknown-path-....png), so
+                   bin/proof-markdown can caption each with its scenario. The
+                   change is the one the branch names, else the only one in
+                   openspec/changes/; --change <id> picks another, active or
+                   archived. Commit the files and put them in the PR with
+                   bin/proof-markdown.
+  --video          with --proof, also record a video of every test (.webm,
+                   beside its screenshot); off by default
+  --changed        run only the tests citing a scenario of a capability whose
+                   specs the branch changes against the merge base with
+                   origin/main, active changes' delta specs included (bin/spec
+                   changed): every scenario of that capability's main spec and
+                   of its deltas. Prints the capabilities it picked and those
+                   no suite test cites; when none is cited it runs nothing and
+                   exits 0, and when the branch changes no specs it runs the
+                   full suite. The fast loop while building a change: run the
+                   full bin/e2e before handover. Refused with --proof, --gates
+                   or a --grep passed through.
+  --gates          lint and typecheck the suite; no stack needed
+
+FACTORY_BUILD_CACHE=gha builds the suite's image with Buildx and BuildKit's
+GitHub Actions cache (scope e2e), as bin/compose does for the stack. It is for
+CI only; any other value fails, and unset builds plainly.
+
+Needs Docker. Run bin/up first: without a running ui, bin/e2e refuses.
+Temporary Docker resources are per invocation and removed on exit.
+HELP
+}
+
+MODE=suite
+CHANGED=0
+VIDEO=0
+CHANGE=""
+PW_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --gates) [ "$MODE" = suite ] || { usage >&2; exit 2; }; MODE=gates ;;
+    --proof) [ "$MODE" = suite ] || { usage >&2; exit 2; }; MODE=proof ;;
+    --changed) CHANGED=1 ;;
+    --video) VIDEO=1 ;;
+    --change) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; CHANGE="$2"; shift ;;
+    --) shift; PW_ARGS=("$@"); break ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+if [ "$MODE" = gates ] && [ "${#PW_ARGS[@]}" -gt 0 ]; then usage >&2; exit 2; fi
+if { [ -n "$CHANGE" ] || [ "$VIDEO" -eq 1 ]; } && [ "$MODE" != proof ]; then usage >&2; exit 2; fi
+# --changed is a test selection of its own: Playwright keeps only one grep.
+if [ "$CHANGED" -eq 1 ]; then
+  [ "$MODE" = suite ] || { usage >&2; exit 2; }
+  for arg in ${PW_ARGS[@]+"${PW_ARGS[@]}"}; do
+    case "$arg" in --grep | --grep=* | -g*) usage >&2; exit 2 ;; esac
+  done
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+CHANGES="$ROOT/openspec/changes"
+
+die() {
+  echo "e2e: $*" >&2
+  exit 1
+}
+
+case "${FACTORY_BUILD_CACHE:-}" in
+  "" | gha) ;;
+  *) die "FACTORY_BUILD_CACHE accepts only gha (the GitHub Actions cache, for CI), not: $FACTORY_BUILD_CACHE" ;;
+esac
+
+# The change folder that holds the proof, under openspec/changes/: --change
+# (active, or archived for a fix after archiving), else the branch's, else the
+# only active one.
+proof_change() {
+  if [ -n "$CHANGE" ]; then
+    local archived
+    if [ -d "$CHANGES/$CHANGE" ]; then
+      echo "$CHANGE"
+      return
+    fi
+    archived="$(find "$CHANGES/archive" -mindepth 1 -maxdepth 1 -type d -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-$CHANGE" 2> /dev/null | sort | tail -1)"
+    [ -n "$archived" ] || die "no change $CHANGE in openspec/changes/ or its archive"
+    echo "archive/$(basename "$archived")"
+    return
+  fi
+  local branch active
+  branch="$(git -C "$ROOT" branch --show-current 2>/dev/null || true)"
+  if [ -n "$branch" ] && [ -d "$CHANGES/$branch" ]; then
+    echo "$branch"
+    return
+  fi
+  active="$(find "$CHANGES" -mindepth 1 -maxdepth 1 -type d ! -name archive -exec basename {} \; 2>/dev/null | sort)"
+  [ -n "$active" ] && [ "$(printf '%s\n' "$active" | wc -l | tr -d ' ')" -eq 1 ] \
+    || die "cannot tell which change holds the proof; pass --change <id>"
+  echo "$active"
+}
+
+# scenario_ids <capability>: the IDs of its scenarios in its main spec and in
+# the active changes' delta specs, one per line, through bin/openspec.
+scenario_ids() {
+  local cap="$1" openspec="${OPENSPEC:-$ROOT/bin/openspec}" json file change names=""
+  if [ -f "$ROOT/openspec/specs/$cap/spec.md" ]; then
+    if ! json="$(cd "$ROOT" && "$openspec" show "$cap" --type spec --json 2> /dev/null)" \
+      || ! jq -e .requirements > /dev/null <<< "$json"; then
+      die "bin/openspec cannot read openspec/specs/$cap/spec.md"
+    fi
+    names="$(jq -r '.requirements[].scenarios[].name' <<< "$json")"
+  fi
+  for file in "$ROOT"/openspec/changes/*/specs/"$cap"/spec.md; do
+    [ -f "$file" ] || continue
+    change="${file#"$ROOT/openspec/changes/"}"
+    change="${change%%/*}"
+    if ! json="$(cd "$ROOT" && "$openspec" show "$change" --json --deltas-only 2> /dev/null)" \
+      || ! jq -e .deltas > /dev/null <<< "$json"; then
+      die "bin/openspec cannot read openspec/changes/$change"
+    fi
+    names="$names"$'\n'"$(jq -r --arg cap "$cap" '.deltas[] | select(.spec == $cap)
+      | (.requirement.scenarios // [.requirements[]?.scenarios[]?]) | .[].name' <<< "$json")"
+  done
+  printf '%s\n' "$names" | sed -n 's/^\[\([a-z0-9-]*\)\].*/\1/p'
+}
+
+# changed_selection: with --changed, picks the tests of the capabilities the
+# branch changes and puts their grep in front of PW_ARGS; exits 0 when no
+# suite test cites one of them.
+changed_selection() {
+  local changes caps cap cited ids="" uncited="" picked
+  changes="$(cd "$ROOT" && "$ROOT/bin/spec" changed --json)" || die "bin/spec changed failed; see the output above"
+  caps="$(jq -r '[.added[].capability, .modified[].capability, .moved[].from, .moved[].to, .removed[].capability, .pending[].deltas[].capability]
+    | map(select(. != null and . != "")) | unique | .[]' <<< "$changes")"
+  if [ -z "$caps" ]; then
+    echo "e2e: the branch changes no specs; running the full suite"
+    return
+  fi
+  echo "e2e: changed capabilities: $(printf '%s\n' "$caps" | paste -sd ' ' -)"
+  cited="$(grep -rhoE '\[[a-z0-9-]+\]' "$ROOT/services/e2e/tests" 2> /dev/null | tr -d '[]' | sort -u || true)"
+  while IFS= read -r cap; do
+    picked="$(scenario_ids "$cap")" || exit 1
+    picked="$(printf '%s\n' "$picked" | sort -u | comm -12 - <(printf '%s\n' "$cited") | sed '/^$/d')"
+    if [ -z "$picked" ]; then
+      uncited="$uncited $cap"
+    else
+      ids="$ids$picked"$'\n'
+    fi
+  done <<< "$caps"
+  [ -z "$uncited" ] || echo "e2e: no end-to-end tests in the suite:$uncited"
+  if [ -z "$ids" ]; then
+    echo "e2e: none of the changed capabilities has an end-to-end test in the suite; nothing to run"
+    exit 0
+  fi
+  PW_ARGS=(--grep "\[($(printf '%s' "$ids" | sort -u | sed '/^$/d' | paste -sd '|' -))\]" ${PW_ARGS[@]+"${PW_ARGS[@]}"})
+}
+
+[ "$CHANGED" -eq 0 ] || changed_selection
+
+PROOF_DIR=""
+if [ "$MODE" = proof ]; then
+  PROOF_DIR="$CHANGES/$(proof_change)/proof"
+fi
+
+if [ "$MODE" != gates ]; then
+  [ -f "$ROOT/.env.session" ] || die "this worktree's stack is not running; start it with bin/up"
+  session() { sed -n "s/^$1=//p" "$ROOT/.env.session"; }
+  PROJECT="$(session COMPOSE_PROJECT_NAME)"
+  [ -n "$PROJECT" ] || die ".env.session names no Compose project; run bin/up"
+  "$ROOT/bin/compose" ps --status running --services 2>/dev/null | grep -qx ui \
+    || die "the stack's ui is not running; start it with bin/up"
+  HOST="$(session FACTORY_PUBLIC_HOST)"
+  HOST="${HOST:-127.0.0.1}"
+  # The browser reaches the forwarders through a name mapped to 127.0.0.1; an
+  # address cannot be remapped, so its requests would bypass them.
+  case "$HOST" in
+    127.0.0.1) ;;
+    *[!0-9.]*) [[ "$HOST" != *:* ]] || die "FACTORY_PUBLIC_HOST=$HOST is an IP address; bin/e2e needs a host name for it (or 127.0.0.1)" ;;
+    *) die "FACTORY_PUBLIC_HOST=$HOST is an IP address; bin/e2e needs a host name for it (or 127.0.0.1)" ;;
+  esac
+  UI_PORT="$(session FACTORY_PORT_UI)"
+  API_PORT="$(session FACTORY_PORT_API)"
+fi
+
+command -v docker > /dev/null 2>&1 || die "Docker is not installed or not on PATH"
+mkdir -p "$ROOT/tmp/e2e"
+OUTPUT="$(mktemp -d "$ROOT/tmp/e2e/run.XXXXXX")"
+ID="$(printf '%s' "${OUTPUT##*.}" | tr '[:upper:]' '[:lower:]')"
+IMAGE="factory-e2e:$ID"
+CONTAINER="factory-e2e-$ID"
+CONTAINER_OWNED=0
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [ "$CONTAINER_OWNED" -eq 1 ]; then docker rm -f "$CONTAINER" > /dev/null 2>&1 || true; fi
+  docker image rm "$IMAGE" > /dev/null 2>&1 || true
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+phase() {
+  local name="$1"
+  shift
+  echo "e2e: $name"
+  "$@" || die "$name failed; see the output above"
+}
+
+if [ "${FACTORY_BUILD_CACHE:-}" = gha ]; then
+  phase image docker buildx build --load -q -t "$IMAGE" \
+    --cache-from type=gha,scope=e2e --cache-to type=gha,mode=max,scope=e2e "$ROOT/services/e2e" > /dev/null
+else
+  phase image docker build -q -t "$IMAGE" "$ROOT/services/e2e" > /dev/null
+fi
+
+if [ "$MODE" = gates ]; then
+  phase lint docker run --rm "$IMAGE" bun run lint
+  phase typecheck docker run --rm "$IMAGE" bun run typecheck
+  exit 0
+fi
+
+# The suite's global setup listens on the slot's ports inside the container and
+# forwards them to the services on the stack's network (services/e2e/AGENTS.md).
+NET_ARGS=(--network "${PROJECT}_private")
+[ "$HOST" = 127.0.0.1 ] || NET_ARGS+=(--add-host "$HOST:127.0.0.1")
+ENV_ARGS=(-e "E2E_BASE_URL=http://$HOST:$UI_PORT" -e "E2E_API_URL=http://$HOST:$API_PORT"
+  -e "E2E_FORWARDS=$UI_PORT=ui:3000,$API_PORT=backend:4000")
+[ "$MODE" != proof ] || ENV_ARGS+=(-e E2E_PROOF=1)
+[ "$VIDEO" -eq 0 ] || ENV_ARGS+=(-e E2E_VIDEO=1)
+CONTAINER_OWNED=1
+docker create --name "$CONTAINER" "${NET_ARGS[@]}" "${ENV_ARGS[@]}" "$IMAGE" \
+  bunx playwright test ${PW_ARGS[@]+"${PW_ARGS[@]}"} > /dev/null
+echo "e2e: suite"
+status=0
+docker start -a "$CONTAINER" || status=$?
+docker cp "$CONTAINER:/app/playwright-report" "$OUTPUT/" > /dev/null 2>&1 || true
+docker cp "$CONTAINER:/app/test-results" "$OUTPUT/" > /dev/null 2>&1 || true
+[ "$MODE" != proof ] || docker cp "$CONTAINER:/app/proof" "$OUTPUT/" > /dev/null 2>&1 || true
+echo "e2e: report and traces: $OUTPUT"
+[ "$status" -eq 0 ] || die "suite failed; open $OUTPUT/playwright-report/index.html"
+
+# The suite's proof reporter names each file after its test: scenario IDs first.
+if [ "$MODE" = proof ]; then
+  mkdir -p "$PROOF_DIR"
+  for file in "$OUTPUT"/proof/*; do
+    [ -f "$file" ] || continue
+    cp "$file" "$PROOF_DIR/"
+    echo "e2e: proof: ${PROOF_DIR#"$ROOT"/}/$(basename "$file")"
+  done
+fi

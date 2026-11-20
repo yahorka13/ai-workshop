@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# File the CRM backlog of the /crm-backlog skill into this repository
+# (bin/repo); the skill runs it.
+set -euo pipefail
+
+LABEL=crm
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ISSUES="$HERE/../.claude/skills/crm-backlog/issues"
+
+usage() {
+  cat <<EOF
+usage: bin/crm-backlog [--dry-run]
+       bin/crm-backlog --help
+
+File every issue of .claude/skills/crm-backlog/issues/, in file-name order,
+into the repository bin/repo prints, labelled "$LABEL" (created when missing).
+An issue file is "# <title>", then "after: <NN>-<slug>" lines naming earlier
+files, then its body; each after: line is filed as "after: #<number>".
+
+Safe to run again: an issue whose title already exists, open or closed, is
+skipped and printed as "exists #<number> <title>". Refuses, writing nothing,
+a repository that is a GitHub template, or one it cannot tell is not: the
+backlog belongs in a copy of the template. A file that breaks the format stops
+the run before anything is written.
+
+  --dry-run   only read: print "would create label $LABEL" when it is
+              missing, "would file <title>" with its after: titles, or
+              "exists #<number> <title>"; create nothing
+
+Exit status: 0 done, 1 refused or failed, 2 usage error.
+Needs gh signed in with access to that repository.
+EOF
+}
+
+DRY=false
+case "$#:${1:-}" in
+  0:) ;;
+  1:--dry-run) DRY=true ;;
+  1:--help | 1:-h) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+# Parallel indexed arrays (bash 3.2 has no associative ones): one entry per
+# issue file, and its after: slugs as one space-separated string.
+SLUGS=()
+TITLES=()
+AFTERS=()
+NUMBERS=()
+
+index_of() {
+  local i
+  for ((i = 0; i < ${#SLUGS[@]}; i++)); do
+    [ "${SLUGS[$i]}" != "$1" ] || { echo "$i"; return 0; }
+  done
+  return 1
+}
+
+# Read and check every file before anything reaches GitHub.
+for file in "$ISSUES"/*.md; do
+  [ -f "$file" ] || { echo "bin/crm-backlog: no issue files in $ISSUES" >&2; exit 1; }
+  name="$(basename "$file")"
+  if [[ ! "$name" =~ ^[0-9][0-9]-[a-z0-9-]+\.md$ ]]; then
+    echo "bin/crm-backlog: $name: name issue files <NN>-<slug>.md" >&2
+    exit 1
+  fi
+  title="$(head -n 1 "$file")"
+  if [[ "$title" != '# '?* ]]; then
+    echo "bin/crm-backlog: $name: the first line must be '# <title>'" >&2
+    exit 1
+  fi
+  if grep -q '^after:[^ ]' "$file"; then
+    echo "bin/crm-backlog: $name: write dependencies as 'after: <NN>-<slug>'" >&2
+    exit 1
+  fi
+  if ! tail -n +2 "$file" | grep -v '^after: ' | grep -q '[^[:space:]]'; then
+    echo "bin/crm-backlog: $name: the issue has no body" >&2
+    exit 1
+  fi
+  afters=''
+  while IFS= read -r dep; do
+    if ! index_of "$dep" > /dev/null; then
+      echo "bin/crm-backlog: $name: 'after: $dep' names no earlier issue file" >&2
+      exit 1
+    fi
+    afters="$afters $dep"
+  done < <(sed -n 's/^after: //p' "$file")
+  SLUGS+=("${name%.md}")
+  TITLES+=("${title#'# '}")
+  AFTERS+=("$afters")
+  NUMBERS+=('')
+done
+
+REPO="$("$HERE/repo")"
+
+# A failed read stops the run: never file without knowing.
+IS_TEMPLATE="$(gh repo view "$REPO" --json isTemplate --jq .isTemplate)"
+case "$IS_TEMPLATE" in
+  false) ;;
+  true) echo "bin/crm-backlog: $REPO is a template repository; file the CRM backlog in a copy of it" >&2; exit 1 ;;
+  *) echo "bin/crm-backlog: could not tell whether $REPO is a template repository" >&2; exit 1 ;;
+esac
+
+EXISTING="$(gh issue list -R "$REPO" --state all --limit 1000 --json number,title --jq '.[] | "\(.number)\t\(.title)"')"
+for ((i = 0; i < ${#SLUGS[@]}; i++)); do
+  # ENVIRON, not -v: awk would read backslashes in the title as escapes.
+  NUMBERS[i]="$(TITLE="${TITLES[$i]}" awk -F '\t' '$2 == ENVIRON["TITLE"] { print $1; exit }' <<< "$EXISTING")"
+done
+
+# has_label: the repository has the label.
+has_label() {
+  local labels
+  labels="$(gh label list -R "$REPO" --json name --jq '.[].name' --limit 1000)" || return 1
+  grep -qxF -- "$LABEL" <<< "$labels"
+}
+
+if $DRY; then
+  has_label || echo "would create label $LABEL"
+elif ! has_label; then
+  # Another run may create the label between the listing and here.
+  gh label create "$LABEL" -R "$REPO" --description "The CRM backlog" --color 1D76DB ||
+    has_label || exit 1
+fi
+
+BODY="$(mktemp)"
+trap 'rm -f "$BODY"' EXIT
+
+for ((i = 0; i < ${#SLUGS[@]}; i++)); do
+  title="${TITLES[$i]}"
+  if [ -n "${NUMBERS[$i]}" ]; then
+    echo "exists #${NUMBERS[$i]} $title"
+    continue
+  fi
+  if $DRY; then
+    echo "would file $title"
+    for dep in ${AFTERS[$i]}; do
+      echo "  after: ${TITLES[$(index_of "$dep")]}"
+    done
+    continue
+  fi
+  {
+    for dep in ${AFTERS[$i]}; do
+      echo "after: #${NUMBERS[$(index_of "$dep")]}"
+    done
+    tail -n +2 "$ISSUES/${SLUGS[$i]}.md" | grep -v '^after: '
+  } > "$BODY"
+  if ! url="$(gh issue create -R "$REPO" --title "$title" --body-file "$BODY" --label "$LABEL")"; then
+    echo "bin/crm-backlog: filing '$title' failed; run again to file the rest" >&2
+    exit 1
+  fi
+  NUMBERS[i]="${url##*/}"
+  if [[ ! "${NUMBERS[$i]}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "bin/crm-backlog: filing '$title' printed no issue URL: $url" >&2
+    exit 1
+  fi
+  echo "filed #${NUMBERS[$i]} $title"
+done

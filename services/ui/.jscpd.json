@@ -1,0 +1,26 @@
+{
+  "minTokens": 50,
+  "minLines": 5,
+  "threshold": 0,
+  "reporters": ["console"],
+  "absolute": true,
+  "noColors": true,
+  "gitignore": true,
+  "path": ["src", "tests", "tooling"],
+  "ignore": [
+    "**/generated/**",
+    "**/node_modules/**",
+    "coverage/**",
+    "dist/**",
+    "storybook-static/**",
+    "**/*.json",
+    "**/*.css",
+    "**/*.md",
+    "**/*.sql",
+    "**/*.txt"
+  ],
+  "formatsExts": {
+    "typescript": ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]
+  },
+  "ignorePattern": ["(?m)^import\\s[^;]*;"]
+}

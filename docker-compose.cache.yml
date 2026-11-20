@@ -1,0 +1,12 @@
+# BuildKit's GitHub Actions cache for the stack's built images, layered by
+# bin/compose only when FACTORY_BUILD_CACHE=gha. CI sets it on a Buildx
+# builder that can reach the Actions cache service; laptops never do.
+services:
+  backend:
+    build:
+      cache_from: ["type=gha,scope=backend"]
+      cache_to: ["type=gha,mode=max,scope=backend"]
+  ui:
+    build:
+      cache_from: ["type=gha,scope=ui"]
+      cache_to: ["type=gha,mode=max,scope=ui"]

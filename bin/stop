@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Stop this worktree's stack, keeping its data, ports and slot.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/stop
+
+Stops this worktree's containers and the stack's background watch (Orca's
+setup hook starts one, bin/session --help). Volumes, the slot and
+.env.session stay, so the next bin/up resumes with the same data. bin/down
+removes everything.
+
+Returns only once no container of the stack runs: it waits up to
+FACTORY_STOP_TIMEOUT seconds (default 30, at most 3600) and otherwise fails,
+naming each container still running.
+HELP
+  exit 0
+fi
+
+TIMEOUT="${FACTORY_STOP_TIMEOUT:-30}"
+if ! [[ "$TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$TIMEOUT" -gt 3600 ]; then
+  echo "FACTORY_STOP_TIMEOUT must be a whole number of seconds from 1 to 3600, not: $TIMEOUT" >&2
+  exit 2
+fi
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if [ ! -f "$ROOT/.env.session" ]; then
+  echo "No session for this worktree; nothing to stop."
+  exit 0
+fi
+SLOT="$(sed -n 's/^FACTORY_SESSION_ID=//p' "$ROOT/.env.session")"
+PROJECT="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$ROOT/.env.session")"
+if [ -z "$PROJECT" ]; then
+  echo "bin/stop: .env.session has no COMPOSE_PROJECT_NAME; run bin/up to rewrite it." >&2
+  exit 1
+fi
+LABEL="label=com.docker.compose.project=$PROJECT"
+[ -z "$SLOT" ] || "$ROOT/bin/session" watch-stop "$SLOT" || true
+"$ROOT/bin/compose" stop
+
+# Compose's stop has returned; wait until Docker lists none of the stack running.
+# A failing docker ps ends bin/stop with its status: it never reads as stopped.
+for ((waited = 0; ; waited++)); do
+  running="$(docker ps -q --filter "$LABEL")"
+  [ -n "$running" ] || exit 0
+  [ "$waited" -lt "$TIMEOUT" ] || break
+  sleep 1
+done
+running="$(docker ps --filter "$LABEL" --format '{{.Label "com.docker.compose.service"}} ({{.Status}}): {{.Names}}')"
+[ -n "$running" ] || exit 0 # the last one stopped since the final poll
+{
+  echo "bin/stop: still running after ${TIMEOUT}s:"
+  echo "$running"
+  echo "A container Compose does not stop, such as one of a service no compose file names any more or a"
+  echo "bin/compose run, stops with docker stop <name>. Otherwise read why with bin/logs <service>;"
+  echo "FACTORY_STOP_TIMEOUT sets a longer wait."
+} >&2
+exit 1

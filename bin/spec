@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+# Read the OpenSpec specs one requirement at a time, and see what a branch
+# changed in them, through the pinned CLI's parser (bin/openspec show --json).
+#
+#     bin/spec find <query> [--json]
+#     bin/spec show <scenario-id | requirement name> [--json]
+#     bin/spec changed [--base <ref>] [--json]
+#     bin/spec review [--base <ref>]
+set -euo pipefail
+export LC_ALL=C # sort compares paths byte by byte
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPENSPEC="${OPENSPEC:-$HERE/openspec}"
+
+usage() {
+  cat <<'HELP'
+usage: bin/spec find <query> [--json]
+       bin/spec show <scenario-id | requirement name> [--json]
+       bin/spec changed [--base <ref>] [--json]
+       bin/spec review [--base <ref>]
+
+Reads openspec/specs/ through `bin/openspec show --json`, so it never parses
+a spec itself. Run it anywhere in the repository.
+
+  find     every requirement or scenario whose ID, name or text contains
+           <query> (any letter case, taken literally), with its capability,
+           requirement name and file:line
+  show     one requirement, its text and its scenarios: by scenario ID, by
+           requirement name in any case, or by a part of one name; several
+           matches are listed instead
+  changed  the requirements in openspec/specs/ added, modified, removed or
+           moved (same name and text in another capability) since <ref>,
+           and each active change's pending deltas
+  review   for each requirement `changed` reports as added, modified or
+           moved: its capability's Purpose, its text, its scenarios and,
+           per scenario, the end-to-end tests citing it (services/e2e/tests/,
+           bin/tests/) or its exclusion, the scenario's NO E2E line; it
+           judges nothing
+
+<ref> defaults to the merge base of origin/main and HEAD. --json prints the
+matches as JSON instead of text.
+
+Exits 0 on success, 1 when nothing matched or a name is ambiguous, 2 on bad
+arguments or a spec the CLI cannot read.
+HELP
+}
+
+die() { echo "spec: $*" >&2; exit 2; }
+
+JOBS="${FACTORY_JOBS:-$(getconf _NPROCESSORS_ONLN 2> /dev/null || echo 4)}"
+
+# load_specs <root>: one JSON array, a capability per element:
+# {capability, purpose, file, requirements: [{name, text, line, scenarios:
+# [{id, name, raw, line}]}]}. Line numbers come from the headings.
+load_specs() {
+  local root="$1" out
+  out="$(mktemp -d)"
+  if [ -d "$root/openspec/specs" ]; then
+    # shellcheck disable=SC2016 # expanded by the inner bash
+    find "$root/openspec/specs" -mindepth 2 -maxdepth 2 -name spec.md -type f \
+      | sed -E 's|.*/openspec/specs/([^/]+)/spec\.md$|\1|' | sort \
+      | OUT="$out" ROOT="$root" OPENSPEC="$OPENSPEC" xargs -P "$JOBS" -I{} bash -c '
+          cd "$ROOT"
+          "$OPENSPEC" show "$1" --type spec --json > "$OUT/$1.json" 2> "$OUT/$1.err" \
+            && jq -e .requirements "$OUT/$1.json" > /dev/null 2>&1 \
+            || { echo "$1" >> "$OUT/failed"; exit 0; }
+          grep -n -E "^(### Requirement: |#### Scenario: )" "openspec/specs/$1/spec.md" > "$OUT/$1.lines" || true
+        ' _ {}
+  fi
+  if [ -s "$out/failed" ]; then
+    local cap
+    while IFS= read -r cap; do
+      echo "spec: bin/openspec show cannot read openspec/specs/$cap/spec.md:" >&2
+      cat "$out/$cap.err" "$out/$cap.json" >&2 2> /dev/null || true
+    done < "$out/failed"
+    rm -rf "$out"
+    exit 2
+  fi
+  local file
+  for file in "$out"/*.json; do
+    [ -e "$file" ] || continue
+    local cap
+    cap="$(basename "$file" .json)"
+    jq --arg cap "$cap" --rawfile lines "$out/$cap.lines" '
+      ($lines | split("\n") | map(select(length > 0) | capture("^(?<line>[0-9]+):(?<heading>.*)$"))) as $h
+      # Headings pair with what openspec parsed by position, in file order, so
+      # trailing spaces and repeated names keep each heading its own line.
+      | [$h[] | select(.heading | startswith("### Requirement: ")) | .line | tonumber] as $req
+      | [$h[] | select(.heading | startswith("#### Scenario: ")) | .line | tonumber] as $scen
+      | [.requirements | to_entries[] | .key as $r | .value.scenarios | keys[] | [$r, .]] as $order
+      | {capability: $cap, purpose: (.overview // ""), file: "openspec/specs/\($cap)/spec.md",
+         requirements: [.requirements | to_entries[] | .key as $r | .value | {name, text, line: $req[$r],
+           scenarios: [.scenarios | to_entries[] | .key as $s | .value | {id: ((.name | capture("^\\[(?<id>[^]]+)\\]") | .id) // null), name, raw: .rawText,
+             line: $scen[$order | index([[$r, $s]])]}]}]}
+    ' "$file"
+  done | jq -s 'sort_by(.capability)'
+  rm -rf "$out"
+}
+
+# Every requirement as one flat element: {capability, purpose, file, name,
+# text, line, scenarios}.
+# shellcheck disable=SC2016 # a jq program
+FLATTEN='[.[] | . as $c | .requirements[] | . + {capability: $c.capability, purpose: $c.purpose, file: $c.file}]'
+
+root() {
+  git rev-parse --show-toplevel 2> /dev/null || die "not inside a git repository"
+}
+
+print_requirement() {
+  jq -r '
+    "\(.capability): \(.name)", "\(.file):\(.line)", "", .text,
+    (.scenarios[] | "", "#### Scenario: \(.name)", .raw)
+  '
+}
+
+cmd_find() {
+  local query="" json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help) usage; exit 0 ;;
+      --json) json=1 ;;
+      -*) usage >&2; exit 2 ;;
+      *) [ -z "$query" ] || { usage >&2; exit 2; }; query="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$query" ] || { usage >&2; exit 2; }
+  local matches
+  local specs
+  specs="$(mktemp)"
+  load_specs "$(root)" > "$specs" || { rm -f "$specs"; exit 2; }
+  matches="$(jq --arg q "$query" "$FLATTEN"' | ($q | ascii_downcase) as $q | [
+    .[] | . as $r
+    | if (.name + "\n" + .text | ascii_downcase | contains($q)) then
+        {capability, name, file, line, scenario: null}
+      else
+        (.scenarios[] | select((.id // "" | ascii_downcase) == $q or (.name + "\n" + .raw | ascii_downcase | contains($q)))
+          | {capability: $r.capability, name: $r.name, file: $r.file, line, scenario: .name})
+      end
+  ]' "$specs")"
+  rm -f "$specs"
+  if [ "$(jq length <<< "$matches")" -eq 0 ]; then
+    echo "spec: nothing matched: $query" >&2
+    exit 1
+  fi
+  if [ "$json" -eq 1 ]; then jq . <<< "$matches"; return; fi
+  jq -r '.[] | "\(.capability)  \(.name)  \(.file):\(.line)" + (if .scenario then "  \(.scenario)" else "" end)' <<< "$matches"
+}
+
+cmd_show() {
+  local query="" json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help) usage; exit 0 ;;
+      --json) json=1 ;;
+      -*) usage >&2; exit 2 ;;
+      *) [ -z "$query" ] || { usage >&2; exit 2; }; query="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$query" ] || { usage >&2; exit 2; }
+  local matches
+  local specs
+  specs="$(mktemp)"
+  load_specs "$(root)" > "$specs" || { rm -f "$specs"; exit 2; }
+  matches="$(jq --arg q "$query" "$FLATTEN"' | ($q | ascii_downcase) as $q
+    | [.[] | select(any(.scenarios[]; (.id // "" | ascii_downcase) == $q))] as $byid
+    | [.[] | select(.name | ascii_downcase == $q)] as $exact
+    | [.[] | select(.name | ascii_downcase | contains($q))] as $part
+    | if ($byid | length) > 0 then $byid elif ($exact | length) > 0 then $exact else $part end' "$specs")"
+  rm -f "$specs"
+  case "$(jq length <<< "$matches")" in
+    0) echo "spec: nothing matched: $query" >&2; exit 1 ;;
+    1) ;;
+    *)
+      echo "spec: $query matches several requirements:" >&2
+      jq -r '.[] | "  \(.capability): \(.name)  \(.file):\(.line)"' <<< "$matches" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$json" -eq 1 ]; then
+    jq '.[0] | {capability, file, line, name, text, scenarios}' <<< "$matches"
+  else
+    jq '.[0]' <<< "$matches" | print_requirement
+  fi
+}
+
+# base_ref <ref or empty>: the commit to compare with.
+base_ref() {
+  if [ -n "$1" ]; then
+    git rev-parse --verify --quiet "$1^{commit}" || die "not a commit: $1"
+  else
+    git merge-base origin/main HEAD 2> /dev/null || die "no merge base with origin/main; pass --base <ref>"
+  fi
+}
+
+# changes_json <root> <base>: {added, removed, moved, modified, pending}.
+changes_json() {
+  local top="$1" base="$2" past
+  past="$(mktemp -d)"
+  if git -C "$top" cat-file -e "$base:openspec/specs" 2> /dev/null; then
+    git -C "$top" archive "$base" openspec/specs | tar -x -C "$past"
+  fi
+  # Each load is checked: errexit does not reach into command substitutions.
+  load_specs "$past" > "$past.before" || exit 2
+  rm -rf "$past"
+  load_specs "$top" > "$past.after" || exit 2
+  jq "$FLATTEN" "$past.before" > "$past.b" && mv "$past.b" "$past.before"
+  jq "$FLATTEN" "$past.after" > "$past.a" && mv "$past.a" "$past.after"
+  pending_json "$top" > "$past.pending"
+  # Files, not arguments: the whole tree is larger than an argument may be.
+  jq -n --slurpfile b "$past.before" --slurpfile a "$past.after" --slurpfile p "$past.pending" '
+    $b[0] as $b | $a[0] as $a | $p[0] as $p |
+    def key: "\(.capability)\u0000\(.name)";
+    def scen: [.scenarios[] | {name, raw}];
+    ($b | map({key: key, value: .}) | from_entries) as $bk
+    | ($a | map({key: key, value: .}) | from_entries) as $ak
+    | [$a[] | select($bk[key] != null) | . as $x | $bk[key] as $y
+        | select($x.text != $y.text or ($x | scen) != ($y | scen))
+        | . + {from: null, text_changed: ($x.text != $y.text), changed: ([($x | scen) - ($y | scen), ($y | scen) - ($x | scen)] | add | map(.name | capture("^\\[(?<id>[^]]+)\\]").id) | unique)}] as $modified
+    | [$a[] | select($bk[key] == null)] as $new
+    | [$b[] | select($ak[key] == null)] as $gone
+    | reduce $new[] as $x ({added: [], moved: [], modified: $modified, gone: $gone};
+        ([.gone | to_entries[] | select(.value.name == $x.name)] | first) as $m
+        | if $m == null then .added += [$x]
+          elif $m.value.text == $x.text and ($m.value | scen) == ($x | scen) then
+            .moved += [$x + {from: $m.value.capability}] | .gone |= del(.[$m.key])
+          else .modified += [$x + {from: $m.value.capability, text_changed: ($m.value.text != $x.text), changed: []}] | .gone |= del(.[$m.key])
+          end)
+    | {added, moved, modified, removed: .gone, pending: $p}
+  '
+  rm -f "$past.before" "$past.after" "$past.pending"
+}
+
+# pending_json <root>: [{change, deltas: [{operation, capability, name}]}].
+pending_json() {
+  local top="$1" dir change
+  {
+    if [ -d "$top/openspec/changes" ]; then
+      for dir in "$top"/openspec/changes/*/; do
+        change="$(basename "$dir")"
+        [ "$change" != archive ] || continue
+        [ -d "$dir/specs" ] || continue
+        (cd "$top" && "$OPENSPEC" show "$change" --json --deltas-only 2> /dev/null) \
+          | jq -c --arg change "$change" 'select(.deltas) | {change: $change, deltas: [.deltas[] | {operation, capability: .spec, name: (.requirement.name // .requirements[0].name // "")}]}' \
+          || true
+      done
+    fi
+  } | jq -s .
+}
+
+cmd_changed() {
+  local base="" json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help) usage; exit 0 ;;
+      --json) json=1 ;;
+      --base) [ $# -ge 2 ] || { usage >&2; exit 2; }; base="$2"; shift ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  local top changes
+  top="$(root)"
+  cd "$top"
+  base="$(base_ref "$base")"
+  changes="$(changes_json "$top" "$base")" || exit 2
+  if [ "$json" -eq 1 ]; then
+    jq '{added: [.added[] | {capability, name, file, line}], modified: [.modified[] | {capability, from, name, file, line, scenarios: .changed}], moved: [.moved[] | {from, to: .capability, name, file, line}], removed: [.removed[] | {capability, name}], pending}' <<< "$changes"
+    return
+  fi
+  jq -r '
+    if ([.added, .modified, .moved, .removed, .pending] | map(length) | add) == 0 then "specs did not change"
+    else
+      (.added[] | "added     \(.capability)  \(.name)  \(.file):\(.line)"),
+      (.modified[] | "modified  \(if .from then "\(.from) -> " else "" end)\(.capability)  \(.name)  \(.file):\(.line)" + (if (.changed | length) > 0 then "  scenarios: \(.changed | join(", "))" else "" end)),
+      (.moved[] | "moved     \(.from) -> \(.capability)  \(.name)  \(.file):\(.line)"),
+      (.removed[] | "removed   \(.capability)  \(.name)"),
+      (.pending[] | "pending in openspec/changes/\(.change):", (.deltas[] | "  \(.operation | . + (" " * ([7 - length, 0] | max)))  \(.capability)  \(.name)"))
+    end
+  ' <<< "$changes"
+}
+
+cmd_review() {
+  local base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help) usage; exit 0 ;;
+      --base) [ $# -ge 2 ] || { usage >&2; exit 2; }; base="$2"; shift ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  local top changes cited
+  top="$(root)"
+  cd "$top"
+  base="$(base_ref "$base")"
+  changes="$(changes_json "$top" "$base")" || exit 2
+  # Citations: the full ID in brackets under the black-box suites, as
+  # bin/check-spec-coverage.sh reads them.
+  cited="$(mktemp)"
+  (
+    for dir in services/e2e/tests bin/tests; do
+      [ -d "$dir" ] || continue
+      grep -rnoE '\[[a-z]+(-[a-z]+)*-([1-9][0-9]*|[0-9a-f]{6})[],[:space:]]' "$dir" 2> /dev/null || true
+    done | sed -E 's/^([^:]+):[0-9]+:\[([^],[:space:]]+).$/\2 \1/' | sort -u \
+      | jq -R -s 'split("\n") | map(select(length > 0) | split(" ")) | group_by(.[0]) | map({key: .[0][0], value: map(.[1])}) | from_entries'
+  ) > "$cited"
+  jq -r --slurpfile cited "$cited" '
+    $cited[0] as $cited |
+    def excluded: [.raw // "" | match("\\*\\*NO E2E\\*\\* ([^\n]*)") | .captures[0].string] | first;
+    [(.added[] | . + {status: "added"}), (.modified[] | . + {status: "modified"}), (.moved[] | . + {status: "moved from \(.from)"})]
+    | if length == 0 then "no requirement was added, modified or moved" else .[] |
+      "## \(.capability): \(.name) (\(.status))", "\(.file):\(.line)", "",
+      "Purpose: \(.purpose)", "", .text,
+      (.scenarios[] | "", "- \(.name)",
+        (if .id and $cited[.id] then ($cited[.id][] | "    cited by \(.)")
+         elif excluded then "    excluded: \(excluded)"
+         else "    not covered" end)),
+      ""
+    end
+  ' <<< "$changes"
+  rm -f "$cited"
+}
+
+# Sourced (bin/check-spec-obligations.sh reuses the loader): define only.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
+
+case "${1:-}" in
+  --help | -h) usage ;;
+  find) shift; cmd_find "$@" ;;
+  show) shift; cmd_show "$@" ;;
+  changed) shift; cmd_changed "$@" ;;
+  review) shift; cmd_review "$@" ;;
+  *) usage >&2; exit 2 ;;
+esac

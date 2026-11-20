@@ -1,0 +1,289 @@
+# Repository checks. Every rule that matters is a check here (principle 22);
+# .githooks/ only catches the same mistakes earlier. Branch protection, where
+# enabled, requires these job IDs, so keep them stable.
+# The always-on script checks run as the steps of one repo-checks job;
+# repo-checks is the check to require for them.
+name: Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read # change-archived reads the draft state
+
+# A newer commit's run on a pull request cancels the older one still in
+# progress. Other events on the same pull request queue behind it. Pushes to
+# main each run to the end.
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
+
+jobs:
+  repo-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Full history for commit-subjects and the diff of eof-newline.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # bin/openspec runs the pinned OpenSpec CLI through npx.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: commit-subjects
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: bin/check-commit-range.sh "$HEAD_REF" "$BASE_SHA" "$HEAD_SHA"
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      - name: eof-newline
+        if: ${{ !cancelled() }}
+        run: bin/ci-eof-newline.sh "${BASE_SHA:-$BEFORE}" "${HEAD_SHA:-$GITHUB_SHA}"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+      - name: home-paths
+        if: ${{ !cancelled() }}
+        run: bin/check-home-paths.sh
+      - name: conventions
+        if: ${{ !cancelled() }}
+        run: bin/check-conventions.sh
+      # Inline lint suppressions per service only go down (bin/lint-disables.txt),
+      # and no service tracks an eslint-suppressions.json.
+      - name: lint-disables
+        if: ${{ !cancelled() }}
+        run: bin/check-lint-disables.sh
+      # Marked clones per service only go down (bin/duplicate-disables.txt).
+      - name: duplicate-disables
+        if: ${{ !cancelled() }}
+        run: bin/check-disables.sh duplicates
+      # Unused-code exceptions per service only go down (bin/unused-disables.txt).
+      - name: unused-disables
+        if: ${{ !cancelled() }}
+        run: bin/check-disables.sh unused
+      # Import-rule exceptions per service only go down (bin/import-disables.txt).
+      - name: import-disables
+        if: ${{ !cancelled() }}
+        run: bin/check-disables.sh imports
+      # Equivalent-mutant markers per service only go down (bin/mutation-disables.txt),
+      # each in its one form, naming its mutator and reason.
+      - name: mutation-disables
+        if: ${{ !cancelled() }}
+        run: bin/check-disables.sh mutations
+      # Every image reference carries its tag and a digest
+      # (bin/check-image-digests.sh --help says how to bump one).
+      - name: image-digests
+        if: ${{ !cancelled() }}
+        run: bin/check-image-digests.sh
+      - name: openspec-validate
+        if: ${{ !cancelled() }}
+        run: |
+          bin/openspec validate --all --strict
+          bin/openspec validate --archived
+      # Reads the draft state live on every PR event: a push and "ready for
+      # review" seconds apart can leave the event's snapshot stale.
+      - name: change-archived
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: bin/ci-change-archived.sh "$PR" "$HEAD_REF"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.head_ref }}
+      # Migrations are expand-only, and no committed script pushes a live
+      # schema. Applied migrations are never edited: that check compares
+      # against the pull request's base, so it runs on pull requests only.
+      - name: migrations
+        if: ${{ !cancelled() }}
+        run: |
+          bin/check-migrations-expand-only.sh
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            bin/check-migrations-immutable.sh "$BASE_SHA" "$HEAD_SHA"
+          fi
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      - name: claude-plugins
+        if: ${{ !cancelled() }}
+        run: bin/check-claude-plugins.sh
+      # Every scenario has a hash ID and an end-to-end test citing it, or a
+      # NO E2E line with a category and reason (bin/check-spec-coverage.sh --help).
+      - name: spec-coverage
+        if: ${{ !cancelled() }}
+        run: bin/check-spec-coverage.sh
+      # One obligation per requirement: no change or archive since the base adds
+      # or rewrites a bundled requirement (bin/check-spec-obligations.sh --help).
+      - name: spec-obligations
+        if: ${{ !cancelled() }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            bin/check-spec-obligations.sh --base "$BASE_SHA"
+          else
+            bin/check-spec-obligations.sh
+          fi
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      - name: shellcheck
+        if: ${{ !cancelled() }}
+        run: docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d bin/openspec bin/openspec-archive bin/spec bin/issue-start bin/issue-trust bin/factory-graph bin/factory-merge bin/crm-backlog bin/repo bin/setup bin/doctor bin/session bin/compose bin/up bin/stop bin/down bin/logs bin/seed bin/orca-setup bin/orca-archive bin/orca-autostart bin/check bin/audit bin/mutate bin/contracts bin/e2e bin/proof-markdown bin/*.sh bin/tests/*.sh .githooks/*
+      - name: tests
+        if: ${{ !cancelled() }}
+        run: bin/tests/run.sh
+
+  # Principle 23: the commits a run adds are scanned for secrets (all of them on
+  # a first push), and every service's locked dependencies are audited, failing
+  # on a critical advisory. Each step runs in its pinned container.
+  supply-chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: secret-scan
+        if: ${{ !cancelled() }}
+        run: bin/ci-secret-scan.sh "${BASE_SHA:-$BEFORE}" "${HEAD_SHA:-$GITHUB_SHA}"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+      - name: dependency-audit
+        if: ${{ !cancelled() }}
+        run: bin/audit
+
+  # Each service's lint, typecheck, coverage, duplicates, unused and imports
+  # gates in its pinned checks container
+  # (bin/check --help).
+  backend-checks:
+    uses: ./.github/workflows/service-check.yml
+    with:
+      service: backend
+
+  ui-checks:
+    uses: ./.github/workflows/service-check.yml
+    with:
+      service: ui
+
+  # bin/contracts generate on a copy of the repository changes nothing
+  # (bin/tests/contracts.e2e.sh --help).
+  contracts-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: bin/tests/contracts.e2e.sh
+
+  # The ui's runtime image: how nginx serves the app and Storybook
+  # (bin/tests/ui-static.e2e.sh --help).
+  ui-static-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: bin/tests/ui-static.e2e.sh
+      # A cancelled or timed-out job kills the proof before its own cleanup.
+      - if: always()
+        run: |
+          docker ps -aq --filter name=factory-ui-proof- | xargs -r docker rm -f
+          docker images -q --filter reference='factory-ui-proof-*' | xargs -r docker image rm -f
+
+  # The migration history on the stack's PostgreSQL image
+  # (bin/tests/db-migrate.e2e.sh --help).
+  db-migrate-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: bin/tests/db-migrate.e2e.sh
+      # A cancelled or timed-out job kills the proof before its own cleanup.
+      - if: always()
+        run: |
+          docker ps -aq --filter name=factory-db-proof- | xargs -r docker rm -f
+          docker network ls -q --filter name=factory-db-proof- | xargs -r docker network rm
+
+  # bin/check runs the gates with no network, on real Docker
+  # (bin/tests/check-offline.e2e.sh --help).
+  check-offline-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: bin/tests/check-offline.e2e.sh
+      # A cancelled or timed-out job kills the proof before its own cleanup.
+      - if: always()
+        run: |
+          docker ps -aq --filter name=factory-check- | xargs -r docker rm -f
+          docker images -q --filter reference='factory-check:*' | xargs -r docker image rm -f
+
+  # Two worktrees' stacks side by side on the runner's Docker
+  # (bin/tests/sessions.e2e.sh --help).
+  sessions-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      FACTORY_SESSION_SLOTS: 10 # the most; the proof takes three
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: bin/tests/sessions.e2e.sh
+      # A cancelled or timed-out job kills the proof before its own cleanup.
+      - if: always()
+        run: for wt in tmp/sessions-proof/*/worktree*; do [ ! -x "$wt/bin/down" ] || "$wt/bin/down" || true; done
+
+  # The end-to-end suite's lint and typecheck; no stack needed.
+  e2e-gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      FACTORY_BUILD_CACHE: gha # bin/e2e --help
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - run: bin/e2e --gates
+
+  # The end-to-end suite against a throwaway stack (bin/tests/e2e-stack.e2e.sh --help).
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      FACTORY_BUILD_CACHE: gha # bin/compose --help
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - run: bin/tests/e2e-stack.e2e.sh
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-${{ github.run_attempt }}
+          path: |
+            tmp/e2e-stack/*/report/
+            tmp/e2e-stack/*/logs/
+            tmp/e2e-stack/*/*.log
+          retention-days: 14
+      # A cancelled or timed-out job kills the proof before its own cleanup.
+      - if: always()
+        run: for wt in tmp/e2e-stack/*/worktree; do [ ! -x "$wt/bin/down" ] || "$wt/bin/down" || true; done

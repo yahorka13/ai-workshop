@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Orca prompt helper: submit the issue URL Orca pre-fills in an issue
+# workspace's Claude terminal, so the agent starts /work on its own.
+# TODO: once orca.yaml can template the agent prompt, set it to /work {{issue}}
+# and delete this helper and its start in bin/orca-setup.
+set -uo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/orca-autostart
+
+Started in the background by bin/orca-setup. Orca launches an issue
+workspace's agent as `claude --prefill <issue URL>`, which waits for Enter.
+For a bounded time this polls the workspace's Claude terminals through the
+orca CLI and presses Enter in one only when its draft input is exactly
+https://github.com/<owner>/<repo>/issues/<N>, where <owner>/<repo> is what
+bin/repo prints for the workspace. Any other draft, two
+such terminals, no draft within the bound or a missing orca CLI: it sends
+nothing. It always exits 0. bin/orca-setup logs it to
+~/.factory/orca-autostart.log.
+
+Environment:
+  ORCA_WORKTREE_PATH          the workspace (default: the current directory)
+  ORCA_WORKTREE_ID            selects the workspace (default: path:<workspace>)
+  ORCA_CLI_BIN_DIR            where the orca CLI lives when it is not on PATH
+  FACTORY_AUTOSTART_TIMEOUT   seconds to wait for the draft (default: 180)
+  FACTORY_AUTOSTART_INTERVAL  seconds between polls (default: 2)
+HELP
+  exit 0
+fi
+
+WORKTREE="${ORCA_WORKTREE_PATH:-$PWD}"
+TIMEOUT="${FACTORY_AUTOSTART_TIMEOUT:-180}"
+INTERVAL="${FACTORY_AUTOSTART_INTERVAL:-2}"
+SELECTOR="path:$WORKTREE"
+[ -z "${ORCA_WORKTREE_ID:-}" ] || SELECTOR="id:$ORCA_WORKTREE_ID"
+ORCA="$(command -v orca || true)"
+[ -n "$ORCA" ] || [ -z "${ORCA_CLI_BIN_DIR:-}" ] || ORCA="$ORCA_CLI_BIN_DIR/orca"
+
+log() {
+  echo "$(date '+%Y-%m-%dT%H:%M:%S') $WORKTREE: $*"
+}
+
+if [ -z "$ORCA" ] || [ ! -x "$ORCA" ]; then
+  log 'no orca CLI; nothing to do'
+  exit 0
+fi
+
+# This repository, from the workspace's origin; without one nothing can match.
+if ! SLUG="$(cd "$WORKTREE" && "$WORKTREE/bin/repo" 2> /dev/null)" || [ -z "$SLUG" ]; then
+  log 'no origin repository; nothing to do'
+  exit 0
+fi
+# Orca prints JSON one key per line. The draft line must be exactly this; a
+# note, a second line or quotes are escaped into it and do not match. The
+# repository is taken literally: a dot in it matches only a dot.
+SLUG_PATTERN="$(printf '%s' "$SLUG" | sed 's/[][\.*^$+?(){}|/]/\\&/g')"
+ISSUE_DRAFT="^[[:space:]]*\"draft\": \"https://github\\.com/$SLUG_PATTERN/issues/[0-9]+\",?\$"
+OTHER_DRAFT='^[[:space:]]*"draft": "[^"]'
+
+DEADLINE=$((SECONDS + TIMEOUT))
+while :; do
+  MATCHES=()
+  OTHER=''
+  if LIST="$("$ORCA" terminal list --worktree "$SELECTOR" --json 2> /dev/null)"; then
+    for HANDLE in $(printf '%s\n' "$LIST" | awk -F'"' '/"handle":/ { h = $4 } /"agentIdentity": "claude"/ { print h }'); do
+      SCREEN="$("$ORCA" terminal read --terminal "$HANDLE" --screen --json 2> /dev/null)" || continue
+      if grep -Eq "$ISSUE_DRAFT" <<< "$SCREEN"; then
+        MATCHES+=("$HANDLE")
+      elif grep -Eq "$OTHER_DRAFT" <<< "$SCREEN"; then
+        OTHER="$HANDLE"
+      fi
+    done
+  fi
+  if [ "${#MATCHES[@]}" -gt 1 ]; then
+    log 'several Claude terminals hold an issue URL; leaving them'
+    exit 0
+  fi
+  if [ "${#MATCHES[@]}" -eq 1 ]; then
+    if "$ORCA" terminal send --terminal "${MATCHES[0]}" --enter --json > /dev/null 2>&1; then
+      log "submitted the issue URL in ${MATCHES[0]}"
+    else
+      log "could not press Enter in ${MATCHES[0]}"
+    fi
+    exit 0
+  fi
+  if [ -n "$OTHER" ]; then
+    log "$OTHER holds a draft that is not a bare issue URL; leaving it"
+    exit 0
+  fi
+  if [ "$SECONDS" -ge "$DEADLINE" ]; then
+    log "no issue URL draft within ${TIMEOUT}s; nothing to do"
+    exit 0
+  fi
+  sleep "$INTERVAL"
+done

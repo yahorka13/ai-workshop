@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Create the demo user on this worktree's running stack.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/seed
+
+Creates the demo user on this worktree's stack, the one bin/up started:
+
+  email     demo@example.com
+  password  password
+
+It runs the backend's seed command (bun tooling/seed.ts) inside the running
+backend container, which creates each demo user that does not exist and
+changes nothing that does, then prints what it created and what existed.
+bin/up runs it once the stack is healthy, so run it by hand only after
+removing the user.
+
+It seeds nothing else: it refuses when this worktree has no stack or its
+backend is not running, and the seed command itself refuses any stack
+bin/up did not start (the FACTORY_LOCAL_STACK marker only the session's
+Compose file sets).
+HELP
+  exit 0
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+die() {
+  echo "seed: $*" >&2
+  exit 1
+}
+
+[ -f "$ROOT/.env.session" ] || die "no stack for this worktree — run bin/up"
+[ -n "$("$ROOT/bin/compose" ps --status running -q backend 2> /dev/null)" ] \
+  || die "the backend is not running — run bin/up"
+
+exec "$ROOT/bin/compose" exec -T backend bun tooling/seed.ts

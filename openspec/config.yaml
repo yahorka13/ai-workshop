@@ -1,0 +1,47 @@
+schema: factory
+
+context: |
+  Language: English. All artifacts must be written in English.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  Project: a starter web app (sign-in and a dashboard over GraphQL) that grows
+  into a small CRM, one GitHub issue at a time (docs/product.md). Isolated
+  TypeScript-on-Bun services under services/, coupled only through committed
+  contracts. docs/principles.md says why we work this way; AGENTS.md is the
+  source of truth for conventions and commands. Run the CLI as
+  `bin/openspec` (pinned). The GitHub repository is whatever `bin/repo`
+  prints; never name it literally.
+
+  Change names: `<issue>-<6-hex>-<slug>`, created with
+  `bin/openspec-change-id.sh`. The issue's branch is named after its first
+  change; every change of the issue shares that branch and its one PR. The
+  issue number and hash prefix every commit subject:
+  `[12][a3f9c1] api: Description`.
+
+  Capabilities are named by product domain, not by service. Reuse these
+  names; add a new one only when none fits:
+  - auth: identity, sessions, sign-in and sign-out, seeded users
+  - dashboard: the stats query, stat tiles and charts after sign-in
+  - contacts: people in the CRM, their details, list and search
+  - companies: organisations and the contacts linked to them
+  - deals: deals, their pipeline stages and the pipeline board
+  - activities: notes and activities logged against contacts and deals
+  - app-shell: the shared layout, routes and navigation
+  - design-system: tokens, styling rules and shared UI components
+  - database: migrations, runtime roles, seeds
+  - contracts: committed contracts between services, error catalog, shared constants
+  - repo-rules: commit, push and pull request rules and the hooks and checks that enforce them
+  - service-checks: service layout, the check containers, typecheck, lint, tests, coverage, mutation testing
+  - dev-sessions: the worktree's local stack, its session slot and commands, Orca workspace setup
+  - ci: what CI runs and where, scopes, time budgets, stack proofs
+  - spec-coverage: the end-to-end suite, scenario IDs, coverage and exclusions, proof, archiving
+  - spec-tools: reading and checking the specs: bin/spec and the obligation check
+  - agent-workflow: tickets, claiming issues, the work and PR flows, Claude Code plugins, automatic mode
+
+rules:
+  specs:
+    - Scenarios use WHEN/THEN (Gherkin style). Do not replace them with prose use cases.
+    - One obligation per requirement - a second SHALL or MUST is a second requirement; a sentence that only qualifies another folds into it as a clause (bin/check-spec-obligations.sh).
+    - Scenario names start with a stable ID, `[<capability>-<hash>]`, from `bin/scenario-id.sh <capability>`; IDs are always a hash, never a number.
+  tasks:
+    - Tag every step with its service, e.g. `- [ ] 2.1 [api] ...`, or `[repo]` for root files.

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Orca setup hook: start the new workspace's stack, watch its sources and open its UI in Orca.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/orca-setup
+
+Orca's setup hook (see orca.yaml). Runs the workspace's own bin/setup and
+bin/up, which waits until the stack is healthy; exits nonzero when either
+fails, so Orca shows the error and the agent, already open beside setup,
+gets no issue URL submitted. Then it leaves one Compose watch of the stack
+running in the background (bin/session watch-start), so edits to a watched
+service reach it on their own; its output is appended to
+~/.factory/orca-watch-<slot>.log. Running setup again replaces the watch;
+bin/stop, bin/down and the archive hook stop it. A watch that cannot start
+prints a note and does not fail setup.
+
+When the stack has a ui service, setup opens the stack's UI in an Orca
+browser tab of the workspace; a tab that cannot be opened prints a note. Last,
+it starts the workspace's bin/orca-autostart in the background, logging to
+~/.factory/orca-autostart.log, to submit an issue workspace's pre-filled issue
+URL (bin/orca-autostart --help). Each run appends a "started" and an
+"exited <status>" line to ~/.factory/orca-hooks.log.
+
+Environment (set by Orca):
+  ORCA_WORKTREE_PATH     the workspace (default: the current directory)
+  ORCA_WORKTREE_ID       selects the workspace's tab (default: path:<workspace>)
+  ORCA_CLI_BIN_DIR       where the orca CLI lives when it is not on PATH
+  FACTORY_ORCA_HOOK_LOG  the hook log (default: ~/.factory/orca-hooks.log)
+HELP
+  exit 0
+fi
+
+WORKTREE="${ORCA_WORKTREE_PATH:-$PWD}"
+# Appends one line to the hook log; a log that cannot be written is skipped.
+hook_log() {
+  local log="${FACTORY_ORCA_HOOK_LOG:-$HOME/.factory/orca-hooks.log}"
+  {
+    mkdir -p "$(dirname "$log")" \
+      && printf '%s %s %s slot=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" setup "$WORKTREE" "${1:--}" "$2" >> "$log"
+  } 2> /dev/null || true
+}
+session_slot() { sed -n 's/^FACTORY_SESSION_ID=//p' "$WORKTREE/.env.session" 2> /dev/null || true; }
+hook_log "$(session_slot)" started
+# shellcheck disable=SC2154 # status is assigned inside the trap
+trap 'status=$?; hook_log "$(session_slot)" "exited $status"' EXIT
+cd "$WORKTREE"
+"$WORKTREE/bin/setup"
+"$WORKTREE/bin/up"
+"$WORKTREE/bin/session" watch-start "$(session_slot)" "$WORKTREE" \
+  || echo "NOTE: the stack is not watching its sources; run bin/up --watch to sync or rebuild on edits."
+
+SESSION="$WORKTREE/.env.session"
+HOST="$(sed -n 's/^FACTORY_PUBLIC_HOST=//p' "$SESSION")"
+UI_PORT="$(sed -n 's/^FACTORY_PORT_UI=//p' "$SESSION")"
+SELECTOR="path:$WORKTREE"
+[ -z "${ORCA_WORKTREE_ID:-}" ] || SELECTOR="id:$ORCA_WORKTREE_ID"
+ORCA="$(command -v orca || true)"
+[ -n "$ORCA" ] || [ -z "${ORCA_CLI_BIN_DIR:-}" ] || ORCA="$ORCA_CLI_BIN_DIR/orca"
+
+open_tab() {
+  if [ -n "$ORCA" ] && "$ORCA" tab create --url "$1" --worktree "$SELECTOR" --json > /dev/null 2>&1; then
+    echo "Opened $1 in an Orca browser tab."
+  else
+    echo "NOTE: could not open $1 in an Orca browser tab; open it yourself."
+  fi
+}
+
+if "$WORKTREE/bin/compose" config --services 2> /dev/null | grep -qx ui; then
+  open_tab "http://${HOST:-127.0.0.1}:$UI_PORT"
+fi
+
+# TODO: drop with bin/orca-autostart once Orca can template the agent prompt.
+mkdir -p "$HOME/.factory"
+nohup "$WORKTREE/bin/orca-autostart" < /dev/null >> "$HOME/.factory/orca-autostart.log" 2>&1 &

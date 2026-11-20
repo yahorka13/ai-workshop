@@ -1,0 +1,49 @@
+# Generated file: do not edit it by hand.
+# Change its source and run bin/contracts generate.
+
+"""Stats for the dashboard. Signed-in users only."""
+type Dashboard {
+  """Sign-ups on each of the last 7 days (UTC), oldest first, ending today."""
+  signUps: [SignUpDay!]!
+
+  """Every user."""
+  totalUsers: Int!
+}
+
+"""Whether the backend can serve: its database answers."""
+type Health {
+  """True while it can serve."""
+  ok: Boolean!
+}
+
+type Query {
+  """The dashboard's stats. Fails with UNAUTHENTICATED when signed out."""
+  dashboard: Dashboard!
+
+  """The backend's health, as GET /health answers it."""
+  health: Health!
+
+  """The signed-in user, or null for a signed-out request."""
+  viewer: Viewer
+}
+
+"""How many users signed up on one day."""
+type SignUpDay {
+  """Users created on that day."""
+  count: Int!
+
+  """The UTC calendar day, YYYY-MM-DD."""
+  day: String!
+}
+
+"""The signed-in user a request is from."""
+type Viewer {
+  """The user's email."""
+  email: String!
+
+  """The user's ID."""
+  id: ID!
+
+  """The user's name."""
+  name: String!
+}

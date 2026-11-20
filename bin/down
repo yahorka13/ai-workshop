@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Remove this worktree's stack (containers, volumes, networks, images) and free its slot.
+# No `set -e`: a half-removed stack must still give its slot back.
+set -uo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/down
+
+Stops the stack's background watch, removes this worktree's containers,
+volumes, networks and the images built for its project, deletes .env.session
+and frees the session slot. Anything labelled with the session's Compose
+project is removed even without .env.session or a registry entry; pulled
+images and the build cache stay. To keep the data, use bin/stop.
+HELP
+  exit 0
+fi
+
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT="$(cd "$BIN/.." && pwd -P)"
+SESSION_FILE="$ROOT/.env.session"
+
+SLOT=""
+[ ! -f "$SESSION_FILE" ] || SLOT="$(sed -n 's/^FACTORY_SESSION_ID=//p' "$SESSION_FILE")"
+[ -n "$SLOT" ] || SLOT="$("$BIN/session" slot-for "$ROOT" 2> /dev/null || true)"
+if [ -z "$SLOT" ]; then
+  echo "No session for this worktree; nothing to tear down."
+  exit 0
+fi
+
+# The registry decides who owns a slot: a session file left behind by a moved
+# worktree or a wiped registry must never remove another worktree's stack.
+OWNER="$("$BIN/session" list | awk -F '\t' -v slot="$SLOT" '$1 == slot { print $2 }')"
+if [ -n "$OWNER" ] && [ -d "$OWNER" ] && [ "$(cd "$OWNER" && pwd -P)" != "$ROOT" ]; then
+  echo "ERROR: Slot $SLOT belongs to $OWNER, so its stack is not this worktree's. Nothing was removed; delete $SESSION_FILE to forget this stale session." >&2
+  exit 1
+fi
+if ! docker info > /dev/null 2>&1; then
+  echo "ERROR: Docker is not running, so nothing can be removed. Start it and run bin/down again; the session and slot are kept." >&2
+  exit 1
+fi
+
+PROJECT="factory-$SLOT"
+"$BIN/session" watch-stop "$SLOT" || true
+echo "Removing session $SLOT ($PROJECT)..."
+if [ -f "$SESSION_FILE" ]; then
+  "$BIN/compose" down -v --remove-orphans \
+    || echo "NOTE: Compose could not remove the stack; removing it by label instead." >&2
+else
+  echo "NOTE: no .env.session; removing the stack by label." >&2
+fi
+
+"$BIN/session" remove-project "$SLOT"
+
+rm -f "$SESSION_FILE"
+"$BIN/session" release "$SLOT" "$ROOT"
+echo "Session $SLOT removed."
+exit 0

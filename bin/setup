@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Prepare a clone or worktree for work. Safe to run again.
+#
+#     bin/setup
+#
+# Runs its steps in order: the repository's git hooks (.githooks/), the local
+# .env from .env.example (bin/setup-env.sh --help), then the Claude Code
+# plugins .claude/settings.json declares, last, since a plugin install is the
+# slowest step and the one most likely to need a fix. Check the machine with
+# bin/doctor; start the stack with bin/up.
+set -euo pipefail
+
+case "${1:-}" in
+  -h | --help) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "usage: bin/setup" >&2; exit 2 ;;
+esac
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$HERE/setup-git-hooks.sh"
+"$HERE/setup-env.sh"
+"$HERE/setup-claude-plugins.sh"
+echo "Setup done."

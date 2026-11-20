@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# Slot registry for side-by-side stacks: one slot per worktree, each with its
+# own Compose project (factory-<slot>) and a 1000-port block.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/session claim <worktree>        Print the worktree's slot, claiming a free one
+       bin/session release <slot> [path]   Free a slot; kept if another worktree holds it
+       bin/session slot-for <worktree>     Print the worktree's slot, or exit 1
+       bin/session list                    slot<TAB>worktree<TAB>alive|stale
+       bin/session ports <slot>            The slot's port variables
+       bin/session reap                    Remove the stacks of deleted worktrees, free their slots
+       bin/session remove-project <slot>   Remove everything labelled with the slot's
+                                           Compose project (factory-<slot>), its images
+                                           included; the slot stays
+       bin/session watch-start <slot> <worktree>
+                                           Run the worktree's bin/compose watch in the
+                                           background, replacing the slot's watch
+       bin/session watch-stop <slot>       Stop the slot's background watch
+
+Slot n owns host ports 10100+(n-1)*1000 to 11099+(n-1)*1000: the UI takes the
+first, the API the second and Postgres the third. A claim skips slots whose
+ports are already listening (needs ss or lsof) and slots whose Compose project
+still has containers or volumes.
+reap removes a project factory-<slot> when every working directory its
+containers name is gone, or, with no containers, when its slot's worktree is
+gone; a project whose containers name an existing directory is never touched.
+bin/up reaps before every claim. Without Docker, reap removes nothing.
+reap also stops the background watch of every slot it reaps.
+
+watch-start runs one Compose watch per slot in the background (Orca's setup
+hook starts it); its output is appended to ~/.factory/orca-watch-<slot>.log
+and its process is recorded in the registry as watch-<slot>.pid once Compose
+says it is watching. It fails when the watch exits first or stays silent for
+FACTORY_WATCH_START_TIMEOUT seconds. When no service of the stack watches a
+path, it says there is nothing to watch and starts nothing. bin/stop,
+bin/down and reap stop the watch. watch-stop signals the recorded process
+group only while it is still a Compose watch, so a reused process ID is never
+killed.
+bin/up and bin/down call this; you rarely need it directly.
+
+Environment:
+  FACTORY_SESSION_SLOTS     slot limit, 1 to 10 (default 3, for an 8-16 GB laptop)
+  FACTORY_SESSION_REGISTRY  registry directory (default ~/.factory/sessions)
+  FACTORY_LOCK_TIMEOUT      seconds to wait for the registry lock (default 30)
+  FACTORY_REMOVE_TIMEOUT    seconds to wait for a stack's containers to go (default 60)
+  FACTORY_WATCH_START_TIMEOUT  seconds watch-start waits for the watch (default 60)
+HELP
+  exit 0
+fi
+
+SLOTS="${FACTORY_SESSION_SLOTS:-3}" # three stacks fit an 8-16 GB laptop (docker-compose.local.yml)
+REGISTRY="${FACTORY_SESSION_REGISTRY:-$HOME/.factory/sessions}"
+BAND_START=10100
+BLOCK_SIZE=1000
+# The 10100-20099 band holds ten blocks. It starts at 10100, not 10000, so it
+# never meets the first ports of other projects that use 1000-port blocks from 10000.
+MAX_SLOTS=10
+# name:offset inside a slot's block. A service that publishes a port adds one.
+PORT_MAP="FACTORY_PORT_UI:0 FACTORY_PORT_API:1 FACTORY_PORT_POSTGRES:2"
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+check_slot_limit() {
+  case "$SLOTS" in
+    '' | *[!0-9]*) ;;
+    *) [ "$SLOTS" -ge 1 ] && [ "$SLOTS" -le "$MAX_SLOTS" ] && return 0 ;;
+  esac
+  die "FACTORY_SESSION_SLOTS must be a number from 1 to $MAX_SLOTS, got '$SLOTS'"
+}
+
+check_slot() {
+  case "$1" in
+    '' | *[!0-9]*) ;;
+    *) [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le "$MAX_SLOTS" ] && return 0 ;;
+  esac
+  die "slot must be a number from 1 to $MAX_SLOTS, got '$1'"
+}
+
+ports() {
+  local sid block entry
+  check_slot "${1:-}"
+  sid=$((10#$1))
+  block=$((BAND_START + (sid - 1) * BLOCK_SIZE))
+  for entry in $PORT_MAP; do
+    echo "${entry%%:*}=$((block + ${entry#*:}))"
+  done
+}
+
+# ss first: it sees every user's sockets, including Docker's root-owned
+# docker-proxy on Linux, which lsof run as a normal user does not. macOS has
+# no ss, and its lsof sees the OrbStack or Docker Desktop listeners.
+LISTENING=""
+probe_ports() {
+  if command -v ss > /dev/null 2>&1; then
+    LISTENING="$(ss -ltnH 2> /dev/null | awk '{ print $4 }' | sed 's/.*://' | sort -u || true)"
+  elif command -v lsof > /dev/null 2>&1; then
+    LISTENING="$(lsof -nP -iTCP -sTCP:LISTEN 2> /dev/null | awk 'NR > 1 { print $9 }' | sed 's/.*://' | sort -u || true)"
+  else
+    echo "WARNING: neither lsof nor ss is installed, so ports already in use cannot be detected." >&2
+  fi
+}
+
+block_free() {
+  local line
+  for line in $(ports "$1"); do
+    if printf '%s\n' "$LISTENING" | grep -qx "${line#*=}"; then
+      return 1
+    fi
+  done
+}
+
+# A worktree removed without bin/down leaves its project's containers and
+# volumes behind; a new worktree must not start on that data.
+project_free() {
+  local label="label=com.docker.compose.project=factory-$1"
+  command -v docker > /dev/null 2>&1 || return 0
+  [ -z "$(docker ps -aq --filter "$label" 2> /dev/null)" ] \
+    && [ -z "$(docker volume ls -q --filter "$label" 2> /dev/null)" ]
+}
+
+# mkdir is atomic everywhere; flock does not exist on macOS. The owner file
+# tells a slow holder from a dead one, so only a dead holder's lock is broken.
+# The pid alone decides: the registry lives in one user's home on one machine,
+# and macOS renames the host on network changes.
+LOCK=""
+lock_owner() { awk -v field="$2" 'NR == 1 { print $field }' "$1/owner" 2> /dev/null || true; }
+
+# One claim breaks a lock at a time, and only while its owner is still the one
+# it saw: a second claim that read the same dead owner must not remove the lock
+# the first breaker has since taken. Returns 1 when another claim is breaking it.
+break_lock() {
+  mkdir "$1.break" 2> /dev/null || return 1
+  if [ "$(lock_owner "$1" 1)" = "$2" ]; then
+    rm -rf "$1"
+    echo "WARNING: breaking the session lock $3" >&2
+  fi
+  rmdir "$1.break"
+}
+
+acquire_lock() {
+  local lock="$REGISTRY/.lock.d" waited=0 limit="${FACTORY_LOCK_TIMEOUT:-30}" pid host
+  mkdir -p "$REGISTRY"
+  while ! mkdir "$lock" 2> /dev/null; do
+    pid="$(lock_owner "$lock" 1)"
+    host="$(lock_owner "$lock" 2)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null \
+      && break_lock "$lock" "$pid" "held by pid $pid, which is gone"; then
+      continue
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      # No owner recorded: abandoned between the mkdir and the owner write.
+      if [ -z "$pid" ] && break_lock "$lock" "" "which records no owner"; then
+        waited=0
+        continue
+      fi
+      die "the session lock $lock is held by pid $pid on $host after ${limit}s. Wait for it to finish, or remove $lock (and $lock.break, if present) once nothing else is claiming a slot."
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf '%s %s\n' "$$" "$(hostname)" > "$lock/owner"
+  LOCK="$lock"
+  trap release_lock EXIT
+}
+
+release_lock() {
+  [ -n "$LOCK" ] || return 0
+  [ "$(lock_owner "$LOCK" 1)" = "$$" ] || return 0
+  rm -rf "$LOCK"
+}
+
+# One spelling per worktree: macOS reaches /var through /private/var, and Orca
+# may hand over a path that git would resolve differently.
+canonical() {
+  if [ -d "$1" ]; then (cd "$1" && pwd -P); else printf '%s\n' "$1"; fi
+}
+
+holder() { cat "$REGISTRY/$1" 2> /dev/null || true; }
+
+slot_free() {
+  local path
+  path="$(holder "$1")"
+  [ -z "$path" ] || [ ! -d "$path" ]
+}
+
+slot_for() {
+  local want sid path
+  want="$(canonical "$1")"
+  for sid in $(seq 1 "$MAX_SLOTS"); do
+    path="$(holder "$sid")"
+    [ -n "$path" ] || continue
+    if [ "$(canonical "$path")" = "$want" ]; then
+      echo "$sid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+list() {
+  local sid path state
+  for sid in $(seq 1 "$MAX_SLOTS"); do
+    path="$(holder "$sid")"
+    [ -n "$path" ] || continue
+    if [ -d "$path" ]; then state=alive; else state=stale; fi
+    printf '%s\t%s\t%s\n' "$sid" "$path" "$state"
+  done
+}
+
+claim() {
+  local want sid
+  [ -n "${1:-}" ] && [ -d "$1" ] || die "claim needs an existing worktree directory, got '${1:-}'"
+  check_slot_limit
+  want="$(canonical "$1")"
+  probe_ports
+  acquire_lock
+  if sid="$(slot_for "$want")"; then
+    echo "$sid"
+    return 0
+  fi
+  for sid in $(seq 1 "$SLOTS"); do
+    if slot_free "$sid" && ! reaping "$sid" && block_free "$sid" && project_free "$sid"; then
+      printf '%s\n' "$want" > "$REGISTRY/$sid"
+      echo "$sid"
+      return 0
+    fi
+  done
+  {
+    echo "ERROR: no free session slot: all $SLOTS are in use, their ports are taken, or they hold"
+    echo "containers or volumes left by a removed worktree. Run bin/down in a live worktree to free its"
+    echo "slot, or bin/session reap to remove stacks of deleted worktrees (stale below); or raise"
+    echo "FACTORY_SESSION_SLOTS (at most $MAX_SLOTS):"
+    list | sed 's/^/  /'
+  } >&2
+  exit 1
+}
+
+release() {
+  local sid expected path
+  check_slot "${1:-}"
+  sid=$((10#$1))
+  expected="$(canonical "${2:-}")"
+  acquire_lock
+  path="$(holder "$sid")"
+  if [ -n "$expected" ] && [ -n "$path" ] && [ "$(canonical "$path")" != "$expected" ]; then
+    echo "Slot $sid is held by $path, not $expected; leaving it claimed."
+    return 0
+  fi
+  rm -f "$REGISTRY/$sid"
+}
+
+containers_gone() {
+  local waited=0
+  while [ -n "$(docker ps -aq --filter "$1" 2> /dev/null)" ]; do
+    [ "$waited" -lt "${FACTORY_REMOVE_TIMEOUT:-60}" ] || return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+# Everything labelled with the project, including what Compose no longer sees,
+# and the images bin/up builds for it.
+remove_project() {
+  local project ids
+  check_slot "${1:-}"
+  project="factory-$((10#$1))"
+  local label="label=com.docker.compose.project=$project"
+  # Ids are whitespace-separated words, so they are left unquoted on purpose.
+  ids="$(docker ps -aq --filter "$label" 2> /dev/null)"
+  # Another process may be removing the same containers ("already in
+  # progress", "no such container"): what counts is that none are left.
+  # shellcheck disable=SC2086
+  [ -z "$ids" ] || docker rm -f $ids > /dev/null 2>&1 || containers_gone "$label" \
+    || die "$project still has containers after ${FACTORY_REMOVE_TIMEOUT:-60}s: docker ps -a --filter $label"
+  ids="$(docker volume ls -q --filter "$label" 2> /dev/null)"
+  # shellcheck disable=SC2086
+  [ -z "$ids" ] || docker volume rm $ids > /dev/null
+  ids="$(docker network ls -q --filter "$label" 2> /dev/null)"
+  # shellcheck disable=SC2086
+  [ -z "$ids" ] || docker network rm $ids > /dev/null
+  # Images Compose built for the project carry its label; an image another
+  # tag or container still uses stays.
+  ids="$(docker image ls -q --filter "$label" 2> /dev/null | sort -u)"
+  # shellcheck disable=SC2086
+  [ -z "$ids" ] || docker image rm $ids > /dev/null 2>&1 || true
+}
+
+# A reap marks each slot it removes, so another reap leaves that stack alone
+# and no claim takes the slot until its removal is finished. The pid tells a
+# running reap from one that died.
+reaping_record() { printf '%s/.reaping-%s\n' "$REGISTRY" "$1"; }
+reaping() {
+  local pid
+  pid="$(cat "$(reaping_record "$1")" 2> /dev/null)" || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null
+}
+
+# Which stacks are abandoned is decided, and marked, under the lock, so every
+# bin/up on a host that shares the daemon and registry sees one decision; the
+# removal itself takes seconds and runs outside it.
+reap() {
+  local containers volumes sid project path dirs dir alive left found targets="" others="" waited=0
+  if ! command -v docker > /dev/null 2>&1 || ! docker info > /dev/null 2>&1; then
+    echo "Docker is not available; nothing reaped."
+    return 0
+  fi
+  acquire_lock
+  containers="$(docker ps -a --filter label=com.docker.compose.project \
+    --format "{{.Label \"com.docker.compose.project\"}}"$'\t'"{{.Label \"com.docker.compose.project.working_dir\"}}" 2> /dev/null || true)"
+  volumes="$(docker volume ls --filter label=com.docker.compose.project \
+    --format '{{.Label "com.docker.compose.project"}}' 2> /dev/null || true)"
+  for sid in $(seq 1 "$MAX_SLOTS"); do
+    project="factory-$sid"
+    path="$(holder "$sid")"
+    if reaping "$sid"; then
+      others+=" $sid"
+      continue
+    fi
+    dirs="$(printf '%s\n' "$containers" | awk -F '\t' -v p="$project" '$1 == p && $2 != "" { print $2 }' | sort -u)"
+    if [ -n "$dirs" ]; then
+      alive=0
+      while IFS= read -r dir; do
+        [ ! -d "$dir" ] || alive=1
+      done <<< "$dirs"
+      [ "$alive" = 0 ] || continue
+      left="$(printf '%s\n' "$dirs" | sed -n 1p)"
+    else
+      [ -n "$path" ] && [ ! -d "$path" ] || continue
+      left="$path"
+    fi
+    found=0
+    if printf '%s\n' "$containers" | awk -F '\t' -v p="$project" '$1 == p { found = 1 } END { exit !found }' \
+      || printf '%s\n' "$volumes" | grep -qx "$project"; then
+      found=1
+    fi
+    echo "$$" > "$(reaping_record "$sid")"
+    targets+="$sid"$'\037'"$found"$'\037'"$path"$'\037'"$left"$'\n'
+  done
+  release_lock
+  # \037, not a tab: read merges empty tab-separated fields, and path may be empty.
+  while IFS=$'\037' read -r sid found path left; do
+    [ -n "$sid" ] || continue
+    watch_stop "$sid" > /dev/null
+    if [ "$found" = 1 ]; then
+      remove_project "$sid"
+      echo "Removed factory-$sid, left by $left."
+    fi
+    acquire_lock
+    if [ -n "$path" ] && [ ! -d "$path" ] && [ "$(holder "$sid")" = "$path" ]; then
+      rm -f "$REGISTRY/$sid"
+    fi
+    rm -f "$(reaping_record "$sid")"
+    release_lock
+  done <<< "$targets"
+  # Another bin/up is removing these; the claim after this reap needs them gone.
+  for sid in $others; do
+    while reaping "$sid"; do
+      [ "$waited" -lt "${FACTORY_REMOVE_TIMEOUT:-60}" ] || die "factory-$sid is still being removed by pid $(cat "$(reaping_record "$sid")" 2> /dev/null) after ${FACTORY_REMOVE_TIMEOUT:-60}s"
+      sleep 1
+      waited=$((waited + 1))
+    done
+  done
+}
+
+watch_record() { printf '%s/watch-%s.pid\n' "$REGISTRY" "$1"; }
+watch_log() { printf '%s/.factory/orca-watch-%s.log\n' "$HOME" "$1"; }
+
+# True while the process exists and is not a zombie.
+running() {
+  local state
+  state="$(ps -o stat= -p "$1" 2> /dev/null)" || return 1
+  [[ "$state" != Z* ]]
+}
+
+# True while the process is a live Compose watch; a zombie or a reused ID is not.
+is_watch() {
+  local args
+  args="$(ps -o args= -p "$1" 2> /dev/null)" || return 1
+  [[ "$args" == *compose*watch* ]]
+}
+
+watch_stop() {
+  local sid record pid
+  check_slot "${1:-}"
+  sid=$((10#$1))
+  record="$(watch_record "$sid")"
+  pid="$(cat "$record" 2> /dev/null || true)"
+  if [ -n "$pid" ] && is_watch "$pid"; then
+    kill_group "$pid"
+    echo "Stopped the stack's watch."
+  fi
+  rm -f "$record"
+}
+
+# TERM the process group, then KILL it if it is still there after 10s.
+kill_group() {
+  kill -TERM -- "-$1" 2> /dev/null || true
+  for _ in $(seq 100); do
+    kill -0 -- "-$1" 2> /dev/null || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$1" 2> /dev/null || true
+}
+
+# The watch leads its own process group, so watch-stop ends its builds too, and
+# ignores hangups, so it outlives the terminal that started it. It counts as
+# started once Compose logs "Watch enabled", which comes once the stack is in
+# sync. A stack whose services watch nothing has no watch to start: Compose
+# would fail on it.
+watch_start() {
+  local sid root log offset limit pid
+  check_slot "${1:-}"
+  sid=$((10#$1))
+  [ -n "${2:-}" ] && [ -x "$2/bin/compose" ] || die "watch-start needs a worktree with bin/compose, got '${2:-}'"
+  root="$(canonical "$2")"
+  watch_stop "$sid" > /dev/null
+  if ! (cd "$root" && "$root/bin/compose" config 2> /dev/null) | grep -q '^ *develop:'; then
+    echo "Nothing to watch yet: no service of the stack watches a path."
+    return 0
+  fi
+  log="$(watch_log "$sid")"
+  mkdir -p "$(dirname "$log")" "$REGISTRY"
+  # The log is appended to: only what this watch writes counts.
+  offset=0
+  [ ! -f "$log" ] || offset="$(wc -c < "$log")"
+  limit="${FACTORY_WATCH_START_TIMEOUT:-60}"
+  set -m
+  (cd "$root" && exec nohup "$root/bin/compose" watch) < /dev/null >> "$log" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq $((limit * 10))); do
+    # Our own child: until it has exec'd Compose it still runs this shell,
+    # so only its exit counts, not what it runs yet.
+    running "$pid" || die "the stack's watch exited before it started watching; see $log"
+    if tail -c +$((offset + 1)) "$log" | grep -q 'Watch enabled'; then
+      echo "$pid" > "$(watch_record "$sid")"
+      echo "Watching the stack; log: $log"
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill_group "$pid"
+  die "the stack's watch did not start watching within ${limit}s and was stopped; see $log"
+}
+
+case "${1:-}" in
+  claim) claim "${2:-}" ;;
+  release) release "${2:-}" "${3:-}" ;;
+  slot-for)
+    [ -n "${2:-}" ] || die "usage: bin/session slot-for <worktree>"
+    slot_for "$2"
+    ;;
+  list) list ;;
+  ports) ports "${2:-}" ;;
+  remove-project) remove_project "${2:-}" ;;
+  reap) reap ;;
+  watch-start) watch_start "${2:-}" "${3:-}" ;;
+  watch-stop) watch_stop "${2:-}" ;;
+  *) die "unknown command '${1:-}'. Run bin/session --help" ;;
+esac

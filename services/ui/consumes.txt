@@ -1,0 +1,2 @@
+# Producers whose contracts/ this service reads; bin/check mounts each at /contracts/<name>/.
+backend

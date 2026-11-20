@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Refuse what AGENTS.md → "Safety" forbids before anything leaves the machine.
+# Installed by bin/setup-git-hooks.sh.
+#
+# Refused, on every line git hands over:
+#   - a push that replaces a branch's remote commits instead of extending them
+#     (a force-push), and one whose remote commit is not known here, which
+#     only a force-push could land: fetch and merge it first;
+#   - a push or deletion of main, which changes reach through a pull request.
+#     A human pushing on purpose sets FACTORY_PUSH_PROTECTED=1, which lets a
+#     fast-forward through and never a force-push.
+#
+# Arguments from git: <remote> <url>; ref lines on stdin.
+set -euo pipefail
+
+REFS="$(cat)"
+ZERO='^0+$'
+
+refuse() {
+  echo "pre-push: $1" >&2
+  exit 1
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${remote_ref:-}" ] || continue
+  branch="${remote_ref#refs/heads/}"
+  [ "$branch" != "$remote_ref" ] || continue # tags and other refs
+  case "$branch" in
+    main)
+      if [[ "$local_sha" =~ $ZERO ]]; then
+        refuse "refusing to delete $branch, a protected branch."
+      fi
+      if [ "${FACTORY_PUSH_PROTECTED:-}" != 1 ]; then
+        refuse "refusing a push to $branch: changes reach $branch through a pull request.
+A human pushing on purpose runs: FACTORY_PUSH_PROTECTED=1 git push origin <commit>:$branch"
+      fi
+      ;;
+  esac
+  if ! [[ "$remote_sha" =~ $ZERO ]] && ! [[ "$local_sha" =~ $ZERO ]] &&
+    ! git cat-file -e "$remote_sha^{commit}" 2> /dev/null; then
+    refuse "$branch has commits this clone does not have, such as a teammate's push.
+Bring them in first: git fetch origin && git merge origin/$branch"
+  fi
+  if ! [[ "$remote_sha" =~ $ZERO ]] && ! [[ "$local_sha" =~ $ZERO ]] &&
+    ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2> /dev/null; then
+    refuse "refusing a force-push to $branch: it would replace commits on the remote ($local_ref).
+Never rewrite pushed history: merge origin/main into the branch instead. Rewriting pushed commits is a human's call."
+  fi
+done <<< "$REFS"

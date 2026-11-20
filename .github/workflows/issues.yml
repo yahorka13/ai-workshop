@@ -1,0 +1,26 @@
+# Keeps issue labels true once an issue closes: bin/issue-start labels an issue
+# "in progress" when /work starts on it, and nothing else would take the label
+# off when the pull request that closes the issue merges. Needs only the
+# workflow's own token.
+name: Issues
+
+on:
+  issues:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  issue-closed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bin/ci-issue-closed.sh "$ISSUE"
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

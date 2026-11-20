@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Reject a malformed commit subject before the commit is created.
+# Installed by bin/setup-git-hooks.sh. fixup!/squash! commits are allowed here;
+# CI rejects them before merge.
+#
+# Arguments from git: <message-file>
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+# Merge commits keep git's own subject.
+[ ! -f "$(git rev-parse --git-path MERGE_HEAD)" ] || exit 0
+
+SUBJECT="$(grep -v -e '^#' -e '^[[:space:]]*$' "$1" | head -n 1 || true)"
+BRANCH="$(git symbolic-ref --quiet --short HEAD || echo HEAD)"
+exec "$ROOT/bin/check-commit-subject.sh" --allow-fixup "$BRANCH" "$SUBJECT"

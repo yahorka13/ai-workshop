@@ -1,0 +1,58 @@
+{
+  "name": "backend",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "bun": "1.4.3"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "db:generate": "bun tooling/generate.ts",
+    "db:check": "bun --bun drizzle-kit check",
+    "db:verify": "bun tooling/verify-migrations.ts",
+    "db:migrate": "bun tooling/migrate.ts",
+    "db:seed": "bun tooling/seed.ts",
+    "lint": "bun --bun eslint . --max-warnings 0 && bun --bun prettier . --check",
+    "format": "bun --bun prettier . --write",
+    "typecheck": "bun --bun tsc --noEmit",
+    "test:unit": "bun test ./tests/unit",
+    "test:integration": "bun test ./tests/integration --timeout 30000",
+    "coverage": "bun tooling/coverage.ts",
+    "mutate": "bun tooling/mutate.ts",
+    "mutate:stryker": "stryker run --testRunner bun",
+    "contracts": "bun tooling/contracts.ts check",
+    "contracts:generate": "bun tooling/contracts.ts generate",
+    "duplicates": "bun --bun jscpd --config .jscpd.json || { echo 'duplicates: extract the shared code into one function or module and import it from both places; a clone that must stay goes between // jscpd:ignore-start <reason> and // jscpd:ignore-end, with bin/duplicate-disables.txt raised'; exit 1; }",
+    "unused": "bun --bun knip --config knip.config.ts --no-progress || { echo 'unused: delete it or stop exporting it; when it is used in a way the checker cannot see, mark it knipignore with a reason and raise bin/unused-disables.txt'; exit 1; }",
+    "imports": "bun --bun depcruise src tests tooling --config .dependency-cruiser.mjs --output-type err-long || { echo 'imports: fix each import as its rule says; a one-off that must stay is a pathNot entry on that rule with // import-exception: <reason>, and bin/import-disables.txt raised'; exit 1; }"
+  },
+  "dependencies": {
+    "@apollo/server": "5.5.1",
+    "@as-integrations/express5": "1.1.2",
+    "@pothos/core": "4.15.1",
+    "better-auth": "1.7.18",
+    "drizzle-orm": "1.0.0-rc.5",
+    "express": "5.3.0",
+    "graphql": "16.14.2",
+    "pg": "8.23.1",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.10",
+    "@eslint-community/eslint-plugin-eslint-comments": "4.8.1",
+    "@eslint/js": "10.0.1",
+    "@hughescr/stryker-bun-runner": "1.6.0",
+    "@stryker-mutator/core": "10.1.1",
+    "@types/bun": "1.4.3",
+    "@types/express": "5.0.6",
+    "@types/pg": "8.23.1",
+    "dependency-cruiser": "18.7.1",
+    "drizzle-kit": "1.0.0-rc.5",
+    "eslint": "10.12.0",
+    "jscpd": "5.4.2",
+    "knip": "6.44.1",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.2"
+  }
+}

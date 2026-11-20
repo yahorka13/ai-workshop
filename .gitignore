@@ -1,0 +1,18 @@
+.DS_Store
+node_modules/
+coverage/
+# A service's Stryker sandbox and reports, inside its mutate container.
+.stryker-tmp/
+services/*/reports/
+tmp/
+.env
+.env.local
+.env.session
+.superpowers/
+
+# Local agent tooling: Claude Code subagent worktrees and Codex's copy of the repo skills.
+.claude/worktrees/
+.agents/
+# Local term lists; never commit them.
+.leak-terms
+.publish-terms

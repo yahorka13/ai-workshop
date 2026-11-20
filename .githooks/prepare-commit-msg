@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Prepend the prefix the branch dictates: [N][hash] on a change branch, [N] on
+# an issue branch. Installed by bin/setup-git-hooks.sh.
+#
+# Arguments from git: <message-file> [<source> [<sha>]]
+set -euo pipefail
+
+MESSAGE_FILE="$1"
+SOURCE="${2:-}"
+
+# Merges, squashes, amends and -c/-C reuse a message that already has its form.
+case "$SOURCE" in
+  merge | squash | commit) exit 0 ;;
+esac
+
+BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+[ -n "$BRANCH" ] || exit 0
+PREFIX="$("$(git rev-parse --show-toplevel)/bin/commit-prefix.sh" "$BRANCH")"
+[ -n "$PREFIX" ] || exit 0
+
+case "$(head -n 1 "$MESSAGE_FILE")" in
+  '['* | 'fixup! '* | 'squash! '* | 'amend! '*) exit 0 ;;
+esac
+
+{ printf '%s ' "$PREFIX"; cat "$MESSAGE_FILE"; } > "$MESSAGE_FILE.prefixed"
+mv "$MESSAGE_FILE.prefixed" "$MESSAGE_FILE"

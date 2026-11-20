@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Print the <owner>/<repo> of this checkout's origin remote.
+#
+#     bin/repo                   # e.g. octo-org/my-crm
+#     gh issue view 3 -R "$(bin/repo)"
+#
+# Every script and skill names the repository this way, never by a literal
+# name, so each copy of the template works unchanged (`conventions`).
+# Accepts git@github.com:o/r.git, https://github.com/o/r[.git][/] and
+# ssh://git@github.com/o/r.git, with or without a port, ssh.github.com (SSH
+# on port 443), and an SSH host alias that `ssh -G` resolves to either host.
+# Exits 1 without an origin remote or when origin is not on GitHub.
+set -euo pipefail
+
+case "${1:-}" in
+  -h | --help) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "usage: bin/repo" >&2; exit 2 ;;
+esac
+
+if ! url="$(git remote get-url origin 2> /dev/null)"; then
+  echo "bin/repo: no origin remote; add one: git remote add origin <url>" >&2
+  exit 1
+fi
+
+# Split the URL into host and path: scheme://[user@]host[:port]/path, or the
+# scp-style [user@]host:path.
+url_re='^[a-z+]+://([^@/]+@)?([^:/]+)(:[0-9]+)?/(.*)$'
+scp_re='^([^@/:]+@)?([^:/]+):(.*)$'
+if [[ "$url" =~ $url_re ]]; then
+  host="${BASH_REMATCH[2]}"
+  path="${BASH_REMATCH[4]}"
+elif [[ "$url" =~ $scp_re ]]; then
+  host="${BASH_REMATCH[2]}"
+  path="${BASH_REMATCH[3]}"
+else
+  host=""
+  path=""
+fi
+
+# An SSH host alias (Host gh-work in ~/.ssh/config) counts when ssh resolves
+# it to github.com.
+# ssh.github.com is GitHub's SSH host on port 443.
+if [ "$host" = ssh.github.com ]; then host=github.com; fi
+if [ -n "$host" ] && [ "$host" != github.com ] && command -v ssh > /dev/null 2>&1; then
+  resolved="$(ssh -G "$host" 2> /dev/null | awk '$1 == "hostname" { print $2; exit }' || true)"
+  case "$resolved" in github.com | ssh.github.com) host=github.com ;; esac
+fi
+
+path="${path%/}"
+path="${path%.git}"
+path_re='^/?([^/]+)/([^/]+)$'
+if [ "$host" = github.com ] && [[ "$path" =~ $path_re ]]; then
+  echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+else
+  echo "bin/repo: origin is not a GitHub repository: $url" >&2
+  exit 1
+fi

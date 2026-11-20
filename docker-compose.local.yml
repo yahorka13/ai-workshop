@@ -1,0 +1,17 @@
+# Every local stack, layered by bin/compose: CPU and memory limits, so several
+# worktrees' stacks fit on one machine side by side. The slot count
+# (FACTORY_SESSION_SLOTS, default 3, bin/session --help) assumes an 8-16 GB
+# laptop; measure again when a service is added, at its peak over a first
+# bin/up on fresh volumes and a full end-to-end run, and set memory to about
+# 1.5x that peak. No CPU limit exceeds 2: Docker refuses one above the host's
+# cores. Datastores keep at least 256m for their caches.
+services:
+  postgres:
+    cpus: 1 # pgbench with 8 clients saturates it
+    mem_limit: 256m # peak 176m under pgbench, 17m idle
+  backend:
+    cpus: 1 # a burst of 1200 GraphQL requests, 32 at a time, peaks under 0.5
+    mem_limit: 128m # peak 63m under that burst, 39m idle
+  ui:
+    cpus: 0.25 # 4000 asset requests, 32 at a time, peak under 0.12
+    mem_limit: 32m # peak 11m under that burst; nginx needs headroom to start

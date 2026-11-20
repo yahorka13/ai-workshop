@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Mutation-test a service in its pinned mutate container (StrykerJS).
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+usage: bin/mutate <service> [--changed] [--base <ref>]
+       bin/mutate --help
+
+Build the service Dockerfile's mutate target and run StrykerJS in it against
+the service's unit and integration tests. Only a service whose Dockerfile has
+a mutate target can be mutated; any other is refused before Docker runs.
+
+A whole run takes hours: CI's mutation workflow runs it when a person starts
+it with gh workflow run mutation -R "$(bin/repo)", and nothing else does. Do
+not run it while working.
+
+--changed mutates only the source lines this worktree adds or changes against
+the base: committed, uncommitted and untracked files under services/<service>/src
+alike. The base is the merge base with origin/main unless --base <ref> names
+another. The run fails when any mutant
+survives or no test covers it, and lists each one: file, line, mutator, the
+original code and the mutant. Kill each with a test that fails on it, or, when
+the mutant cannot change behaviour, mark its line above with
+  // Stryker disable next-line <mutator>: <reason>
+and raise the service's count in bin/mutation-disables.txt. With no changed
+source line it prints "Nothing to mutate." and passes without Docker.
+
+Without --changed it mutates the whole source, prints the score and every
+surviving mutant, and fails only when Stryker itself fails. MUTATE_FULL_GLOB,
+comma-separated Stryker mutate patterns such as src/config.ts, narrows that
+run; bin/tests/mutate.e2e.sh uses it.
+
+Each run keeps mutation.json, mutation.html and summary.md in a new folder
+under tmp/mutate/<service>/, printed as "Reports: <folder>", and ends with
+"<service>: passed" or "<service>: failed". FACTORY_JOBS caps Stryker's
+workers, as for bin/check. Requires Docker with a running daemon; no host
+Bun/Node, credentials or running stack.
+HELP
+}
+
+bad_usage() { usage >&2; exit 2; }
+
+service=""
+changed=0
+base=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --changed) changed=1; shift ;;
+    --base) [ "$#" -ge 2 ] && [ -z "$base" ] || bad_usage; base="$2"; shift 2 ;;
+    -*) bad_usage ;;
+    *) [ -z "$service" ] || bad_usage; service="$1"; shift ;;
+  esac
+done
+[ -n "$service" ] || bad_usage
+if [ -n "$base" ] && [ "$changed" -eq 0 ]; then bad_usage; fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+context="$root/services/$service"
+if [[ ! "$service" =~ ^[a-z][a-z0-9-]*$ ]] || [ ! -f "$context/package.json" ] || [ ! -f "$context/Dockerfile" ]; then
+  echo "Unknown service: $service" >&2
+  exit 2
+fi
+if ! grep -qE '^FROM .* AS mutate$' "$context/Dockerfile"; then
+  echo "$service has no mutate target in services/$service/Dockerfile; only a service with one can be mutation tested" >&2
+  exit 2
+fi
+
+# The changed source as Stryker mutate ranges, <path in the service>:<first>-<last>.
+changed_ranges() {
+  local from="$1" prefix="services/$service/"
+  git -C "$root" diff -U0 --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ "$from" -- "${prefix}src" | awk -v prefix="$prefix" '
+    /^\+\+\+ / { file = substr($0, 5); sub(/^b\//, "", file); next }
+    /^@@ / && file ~ /\.tsx?$/ {
+      split($3, added, ",")
+      start = substr(added[1], 2) + 0
+      count = (2 in added) ? added[2] + 0 : 1
+      if (count > 0) printf "%s:%d-%d\n", substr(file, length(prefix) + 1), start, start + count - 1
+    }'
+  git -C "$root" ls-files --others --exclude-standard -- "${prefix}src" | while IFS= read -r file; do
+    case "$file" in
+      *.ts | *.tsx)
+        lines="$(awk 'END { print NR }' "$root/$file")"
+        printf '%s:1-%d\n' "${file#"$prefix"}" "$lines"
+        ;;
+    esac
+  done
+}
+
+ranges=()
+if [ "$changed" -eq 1 ]; then
+  if [ -z "$base" ]; then
+    base="$(git -C "$root" merge-base origin/main HEAD)" || { echo "No merge base with origin/main; fetch it or pass --base <ref>" >&2; exit 2; }
+  fi
+  if ! git -C "$root" rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+    echo "Unknown base: $base" >&2
+    exit 2
+  fi
+  # Only the branch's own changes: a base that moved ahead is diffed from where the branch left it.
+  base="$(git -C "$root" merge-base "$base" HEAD)" || { echo "No merge base with $base" >&2; exit 2; }
+  while IFS= read -r range; do ranges+=("$range"); done < <(changed_ranges "$base")
+  if [ "${#ranges[@]}" -eq 0 ]; then
+    echo "Nothing to mutate."
+    exit 0
+  fi
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required: install Docker and start its daemon" >&2
+  exit 1
+fi
+# shellcheck source=bin/factory-jobs.sh
+. "$root/bin/factory-jobs.sh"
+resolve_factory_jobs
+
+mkdir -p "$root/tmp/mutate/$service"
+output="$(mktemp -d "$root/tmp/mutate/$service/run.$$.XXXXXX")"
+name="factory-mutate-$service-${output##*.}"
+name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+image="$name:local"
+container="$name"
+
+# shellcheck disable=SC2329 # called from the EXIT trap
+cleanup() {
+  docker rm -f "$container" >/dev/null 2>&1 || true
+  docker image rm "$image" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+docker build --target mutate -t "$image" "$context"
+command=(bun tooling/mutate.ts)
+if [ "$changed" -eq 1 ]; then command+=(--changed "${ranges[@]}"); fi
+env_args=(-e "FACTORY_JOBS=$FACTORY_JOBS")
+if [ "$changed" -eq 0 ] && [ -n "${MUTATE_FULL_GLOB:-}" ]; then env_args+=(-e "MUTATE_FULL_GLOB=$MUTATE_FULL_GLOB"); fi
+
+status=0
+docker run --name "$container" "${env_args[@]}" "$image" "${command[@]}" || status=$?
+docker cp "$container:/app/reports/." "$output" >/dev/null 2>&1 || true
+echo "Reports: $output"
+if [ "$status" -eq 0 ]; then echo "$service: passed"; else echo "$service: failed"; fi
+exit "$status"

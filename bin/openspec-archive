@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Archive an OpenSpec change only when its tasks.md has no unfinished task.
+#
+#     bin/openspec-archive 1096-a3f9c1-referral-credits
+#
+# `bin/openspec archive --yes` answers every prompt, including the one that
+# stops on unfinished tasks, so this checks first. Task lines are counted the
+# way OpenSpec 1.14.1 counts them: any list marker, nested or not, with a
+# one-token checkbox; only [x] or [X] is done. A task that will not be done is
+# ticked and says why: "- [x] 2.1 Dropped: <reason>. <task>". A drop with no
+# reason is refused too. Each offending line is printed as <file>:<line>.
+#
+# Exits 0 once archived, 1 on a refusal, 2 on bad arguments or no such change.
+set -euo pipefail
+
+usage() {
+  echo "usage: bin/openspec-archive <change-id>"
+  echo
+  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  -h | --help) usage; exit 0 ;;
+  "" | -*) usage >&2; exit 2 ;;
+esac
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+
+CHANGE="$1"
+ROOT="$(git rev-parse --show-toplevel)"
+OPENSPEC="${OPENSPEC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/openspec}"
+TASKS="openspec/changes/$CHANGE/tasks.md"
+
+if [ ! -d "$ROOT/openspec/changes/$CHANGE" ]; then
+  echo "No change openspec/changes/$CHANGE." >&2
+  exit 2
+fi
+
+# OpenSpec's TASK_LINE_PATTERN in POSIX ERE. The character after the box is
+# captured: a box followed by ( or [ is a link, unless the box is only spaces.
+TASK='^[[:space:]]*([-*+]|[0-9]{1,9}[.)])[[:space:]]*\[[[:space:]]*([^][:space:]]?)[[:space:]]*\](.?)'
+BLANK_BOX='^[[:space:]]*([-*+]|[0-9]{1,9}[.)])[[:space:]]*\[[[:space:]]+\]'
+# A done task's text: optional number, optional [scope] tag, then Dropped:.
+DROPPED='^[[:space:]]*([0-9]+(\.[0-9]+)*[[:space:]]+)?(\[[^]]*\][[:space:]]*)?Dropped:(.*)$'
+
+open=0
+reasonless=0
+number=0
+if [ -f "$ROOT/$TASKS" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    number=$((number + 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ $TASK ]] || continue
+    marker="${BASH_REMATCH[2]}"
+    after="${BASH_REMATCH[3]}"
+    if [[ "$after" == "(" || "$after" == "[" ]] && ! [[ "$line" =~ $BLANK_BOX ]]; then
+      continue
+    fi
+    if [[ "$marker" != [xX] ]]; then
+      echo "$TASKS:$number: $line" >&2
+      open=$((open + 1))
+    elif [[ "${line#*]}" =~ $DROPPED ]]; then
+      reason="${BASH_REMATCH[4]}"
+      reason="${reason//[[:space:].]/}"
+      if [ -z "$reason" ]; then
+        echo "$TASKS:$number: $line" >&2
+        reasonless=$((reasonless + 1))
+      fi
+    fi
+  done < "$ROOT/$TASKS"
+fi
+
+if [ "$open" -gt 0 ]; then
+  echo "Refusing to archive $CHANGE: $open unfinished task(s). Tick each done task, or write it as \"- [x] N.M Dropped: <reason>. <task>\"." >&2
+fi
+if [ "$reasonless" -gt 0 ]; then
+  echo "Refusing to archive $CHANGE: $reasonless task(s) dropped without a reason. Write \"Dropped: <reason>.\"" >&2
+fi
+[ "$open" -eq 0 ] && [ "$reasonless" -eq 0 ] || exit 1
+
+cd "$ROOT"
+exec "$OPENSPEC" archive "$CHANGE" --yes

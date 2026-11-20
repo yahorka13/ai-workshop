@@ -1,0 +1,3 @@
+# Build output of `bun run build` and `bun run build-storybook`.
+dist/
+storybook-static/

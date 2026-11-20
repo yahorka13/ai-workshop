@@ -1,0 +1,29 @@
+# Every text file checks out with LF, on every platform: a script with CRLF
+# endings fails with "bad interpreter" on WSL and Windows checkouts.
+* text=auto eol=lf
+
+# Binary files are never converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.webm binary
+
+# Collapsed by default in GitHub pull request diffs and left out of the
+# repository's language statistics. The files stay plain text in git.
+
+# Consumer types generated from the producers' contracts (bin/contracts generate).
+services/ui/src/services/graphql/generated/** linguist-generated=true
+services/*/src/generated/** linguist-generated=true
+
+# OpenSpec changes and living specs.
+openspec/changes/** linguist-generated=true
+openspec/specs/** linguist-generated=true
+
+# Tests, in every tests/ folder.
+**/tests/** linguist-generated=true
+
+# Producer contracts, generated from their source (bin/contracts generate).
+*.graphql linguist-generated=true
+*.schema.json linguist-generated=true

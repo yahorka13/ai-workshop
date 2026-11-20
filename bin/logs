@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Show logs of this worktree's stack.
+set -euo pipefail
+
+if [ "${1:-}" = --help ]; then
+  cat <<'HELP'
+Usage: bin/logs [service...] [docker compose logs flags]
+
+Shows logs of this worktree's stack; flags pass through to Compose, e.g.
+  bin/logs postgres -f --since 5m
+  bin/logs --tail 100
+List the services with bin/compose config --services.
+HELP
+  exit 0
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+exec "$ROOT/bin/compose" logs "$@"

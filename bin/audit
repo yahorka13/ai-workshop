@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# CI's dependency-audit step: audit each service's locked dependencies with
+# bun audit in the pinned Bun image.
+set -uo pipefail
+
+BUN_IMAGE=oven/bun:1.4.3@sha256:ec06c3b6cea04192ae6770c434f668ca41d343ad19fa6472216c7b48be39c598
+
+usage() {
+  cat <<'EOF'
+usage: bin/audit [<service>...]
+       bin/audit --help
+
+Audit the locked dependencies of each named service, or of every service
+under services/ with a bun.lock, with bun audit in the Bun image named in this
+script. Every high or critical advisory is printed; a critical one fails the
+service. Every service is audited even after one fails. The service folder is
+mounted read-only; its package.json and bun.lock are copied into the
+container, since bun audit opens them for writing.
+
+Fix a failure by upgrading the package: bun audit fix in the Bun image named
+in this script, by its digest (docker run --rm -v
+"$PWD/services/<service>:/app" -w /app <that image> bun audit fix), then
+bin/check <service>. A registry outage fails too: rerun.
+
+Exit status: 0 no critical advisory, 1 one or more, 2 usage or an unknown
+service. Needs Docker and the npm registry; CI runs it in the supply-chain
+job.
+EOF
+}
+
+[ "${1:-}" = --help ] && { usage; exit 0; }
+
+ROOT="$(git rev-parse --show-toplevel)"
+SERVICES=()
+if [ "$#" -eq 0 ]; then
+  for lock in "$ROOT"/services/*/bun.lock; do
+    [ -f "$lock" ] && SERVICES+=("$(basename "$(dirname "$lock")")")
+  done
+else
+  for service in "$@"; do
+    [ -f "$ROOT/services/$service/bun.lock" ] || { usage >&2; exit 2; }
+    SERVICES+=("$service")
+  done
+fi
+
+FAILED=()
+for service in ${SERVICES[@]+"${SERVICES[@]}"}; do
+  echo "== $service"
+  if ! docker run --rm -v "$ROOT/services/$service:/src:ro" -w /app "$BUN_IMAGE" \
+    sh -c 'cp /src/package.json /src/bun.lock . && { bun audit --audit-level=high || true; } && bun audit --audit-level=critical > /dev/null'; then
+    echo "audit failed for $service: a critical advisory, or the registry was unreachable (rerun)" >&2
+    FAILED+=("$service")
+  fi
+done
+
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  echo "audit: upgrade the package in ${FAILED[*]}: bun audit fix in the service's pinned image, then bin/check <service> (bin/audit --help)" >&2
+  exit 1
+fi

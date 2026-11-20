@@ -1,0 +1,23 @@
+import { Meta } from "@storybook/addon-docs/blocks";
+
+<Meta title="Introduction" />
+
+# Component base
+
+Every shared component of the ui lives in `src/components/`: shadcn
+primitives in `ui/`, the product's own components beside them. This gallery
+shows each one, in every variant and state, in light and dark. Use the theme
+switch in the toolbar to check both.
+
+## Rules
+
+| Rule                                                             | Why                                                             |
+| ---------------------------------------------------------------- | --------------------------------------------------------------- |
+| Colours, radii and type come from `src/styles/theme.css`         | One place changes the look; lint rejects hex colours in classes |
+| shadcn's shape: `cva` variants, `data-slot`, `asChild`           | Components compose the same way everywhere                      |
+| Content goes in children, not props                              | Screens decide the words                                        |
+| Every component has a story with a usage note and a `Dark` story | The unit tests fail otherwise                                   |
+| A story's address never disappears                               | `tooling/story-ids.txt` only grows                              |
+
+A screen that needs a component the base lacks adds it here first, with its
+tests and its story, rather than building it inline.

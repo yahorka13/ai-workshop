@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Pinned OpenSpec CLI. Use this instead of a global `openspec` so every
+# machine, worktree and CI run resolves the same version.
+set -euo pipefail
+
+OPENSPEC_VERSION="1.14.1"
+
+# The workflow profile decides which skills `init`/`update` generate. It is
+# global per machine by default, so pin it to the repo's copy: every machine
+# then generates the same .claude/skills/openspec-* and .claude/commands/opsx/.
+XDG_CONFIG_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/openspec/cli"
+export XDG_CONFIG_HOME
+
+export OPENSPEC_TELEMETRY=0
+export DO_NOT_TRACK=1
+export OPENSPEC_NO_UPDATE_CHECK=1
+
+if ! command -v npx > /dev/null 2>&1; then
+  echo "bin/openspec: needs Node 24 or later (npx) on this machine; install it from https://nodejs.org" >&2
+  exit 1
+fi
+
+NODE_VERSION="$(node --version 2> /dev/null || true)"
+NODE_MAJOR="${NODE_VERSION#v}"
+NODE_MAJOR="${NODE_MAJOR%%.*}"
+if ! [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]] || [ "$NODE_MAJOR" -lt 24 ]; then
+  echo "bin/openspec: needs Node 24 or later, found ${NODE_VERSION:-no node}; install it from https://nodejs.org" >&2
+  exit 1
+fi
+
+CLI=(npx --yes --loglevel=error "@fission-ai/openspec@${OPENSPEC_VERSION}")
+if [ "${1:-}" != update ]; then
+  exec "${CLI[@]}" "$@"
+fi
+
+# The workflow profile is deliberate (see above): drop the CLI's note advising
+# the core profile, which would change the generated skills.
+status=0
+"${CLI[@]}" "$@" | grep -v -e 'Note: Your custom profile is missing' -e 'openspec config profile core' || status="${PIPESTATUS[0]}"
+exit "$status"
